@@ -68,3 +68,10 @@ for batch in dataloader:
 
 ## Persistence
 The wrapper registers a buffer for the step count, so the curriculum state is automatically saved and loaded with `model.state_dict()`.
+
+## Compatibility
+
+CGGR is designed for **Transformer-based LLMs** (Llama, Mistral, GPT), but it was **specifically engineered to synergize with SRDE (Sparse Routed Delta Experts)**.
+
+*   **SRDE Optimization**: When combined with SRDE, CGGR enables "Double Sparsity"—sparsifying both the forward pass (via MoE routing) and the backward pass (via Gradient Routing). This combination yields the theoretical maximum training efficiency.
+*   **Dense Models**: Works out of the box for standard Transformers.
