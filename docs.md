@@ -61,6 +61,9 @@ CGGR:      loss = CrossEntropy(HARD tokens)    → 25% backward FLOPs
 
 ### Benchmarks (SmolLM-135M)
 
+**Hardware:** RTX 3060  
+**Dataset:** FineWeb-Edu
+
 | Configuration | Forward    | Backward  | Total      | Speedup   |
 | :------------ | :--------- | :-------- | :--------- | :-------- |
 | **Standard**  | 118 ms     | 185 ms    | 309 ms     | 1.0x      |
