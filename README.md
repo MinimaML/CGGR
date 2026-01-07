@@ -12,32 +12,33 @@ pip install cggr
 
 ## Why CGGR?
 
-| Metric              | Standard Training      | CGGR (Batch Split)       | Benefit                           |
-| :------------------ | :--------------------- | :----------------------- | :-------------------------------- |
-| **Backward Pass**   | 100% of tokens         | 25% of tokens            | **4x cheaper** backward pass      |
-| **Forward Pass**    | 1.0x cost              | ~1.1x cost (Pass 1 + 2)  | Negligible overhead (~9ms)        |
-| **Total Speed**     | 1.0x (Baseline)        | **1.4x - 2.0x faster**   | Significant training acceleration |
-| **Data Efficiency** | Learns from all tokens | Prioritizes hard tokens  | Learns faster from hard examples  |
-| **Memory**          | High (full graph)      | **Lower** (sparse graph) | Can increase batch size           |
+| Metric              | Standard Training      | CGGR (Batch Split)      | Benefit                           |
+| :------------------ | :--------------------- | :---------------------- | :-------------------------------- |
+| **Backward Pass**   | 100% of tokens         | 25% of tokens           | 4x cheaper backward pass          |
+| **Forward Pass**    | 1.0x cost              | ~1.1x cost (Pass 1 + 2) | Negligible overhead (~9ms)        |
+| **Total Speed**     | 1.0x (Baseline)        | 1.4x - 2.0x faster      | Significant training acceleration |
+| **Data Efficiency** | Learns from all tokens | Prioritizes hard tokens | Learns faster from hard examples  |
+| **Memory**          | High (full graph)      | Lower (sparse graph)    | Can increase batch size           |
 
 ## Benchmarks
 
-**Hardware:** NVIDIA H100 (Simulated/Proxy)  
+**Hardware:** RTX 3060
 **Model:** SmolLM-135M (Llama architecture)  
 **Dataset:** FineWeb-Edu
+
+```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '16px'}}}%%
+xychart-beta
+    title "Training Step Time (Lower is Better)"
+    x-axis [Standard, CGGR (Optimized)]
+    y-axis "Time (ms)" 0 --> 350
+    bar [309, 220]
+```
 
 | Configuration         | Forward (ms) | Backward (ms) | Total Step (ms) | **Speedup** |
 | :-------------------- | :----------- | :------------ | :-------------- | :---------- |
 | **Standard Training** | 118 ms       | 185 ms        | 309 ms          | 1.0x        |
 | **CGGR (Optimized)**  | **127 ms**   | **93 ms**     | **220 ms**      | **1.40x**   |
-
-### What does this mean?
-Training on **1 Billion Tokens** (2048 tokens/batch):
-- **Standard:** ~42 hours
-- **CGGR:** ~30 hours
-- **Saved:** **12 hours** per Billion tokens
-
-> **Note:** Forward pass overhead is only **9ms** due to the Truncated Router optimization (4 layers vs 30 layers).
 
 ## Quick Start
 
