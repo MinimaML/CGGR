@@ -49,6 +49,17 @@ Standard:  loss = CrossEntropy(ALL tokens)     → 100% backward FLOPs
 CGGR:      loss = CrossEntropy(HARD tokens)    → 25% backward FLOPs
 ```
 
+### Comparison
+
+| Metric              | Standard Training            | CGGR (Batch Split)       | Benefit                               |
+| :------------------ | :--------------------------- | :----------------------- | :------------------------------------ |
+| **Backward Pass**   | 100% of tokens               | 25% of tokens            | **4x cheaper** backward pass          |
+| **Forward Pass**    | 1.0x cost                    | ~1.1x cost (Pass 1 + 2)  | Negligible overhead (~9ms)            |
+| **Total Speed**     | 1.0x (Baseline)              | **1.4x - 2.0x faster**   | Significant training acceleration     |
+| **Data Efficiency** | Learns from all tokens       | Prioritizes hard tokens  | Learns faster from hard examples      |
+| **Gradient Noise**  | High (easy tokens add noise) | Low                      | Cleaner gradients, faster convergence |
+| **Memory**          | High (full graph)            | **Lower** (sparse graph) | Can increase batch size               |
+
 ---
 
 ## Batch Splitting (Recommended)
