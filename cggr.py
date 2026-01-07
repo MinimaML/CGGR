@@ -102,29 +102,19 @@ class CGGRLoss(nn.Module):
         
         num_tokens = logits_flat.shape[0]
         
-        # Compute per-token loss
-        per_token_loss = self.base_loss(logits_flat, targets_flat)
-        
-        # Compute difficulty scores (Triton-accelerated)
+        # STEP 1: Compute difficulty scores to select tokens (no grad needed)
         with torch.no_grad():
-            # Choose scoring method
-            if self.scoring == 'loss':
-                difficulty = per_token_loss.detach()
-                confidence = torch.zeros_like(difficulty)
-                entropy = difficulty
-            else:
-                use_targets = self.scoring in ['combined', 'loss']
-                difficulty, confidence, entropy = fused_difficulty_score(
-                    logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat,
-                    targets=targets_flat if use_targets else None,
-                )
-                difficulty = difficulty.view(-1)
-                confidence = confidence.view(-1)
-                entropy = entropy.view(-1)
+            # Compute difficulty from logits (fast - just softmax + entropy)
+            difficulty, confidence, entropy = fused_difficulty_score(
+                logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat,
+                targets=None,  # Don't use targets for selection to avoid computing loss
+            )
+            difficulty = difficulty.view(-1)
+            confidence = confidence.view(-1)
+            entropy = entropy.view(-1)
             
             # Compute current ratio with curriculum
             if self.warmup_steps <= 0:
-                # No warmup - use target ratio immediately
                 progress = 1.0
             else:
                 progress = min(1.0, self.step_count.item() / self.warmup_steps)
@@ -153,13 +143,18 @@ class CGGRLoss(nn.Module):
                 mask = select_tokens_topk(difficulty, current_ratio)
             
             mask = mask.view(-1)
-            tokens_selected = mask.sum().item()
+            selected_indices = torch.nonzero(mask, as_tuple=True)[0]
+            tokens_selected = selected_indices.numel()
         
-        # Apply mask to loss (Triton-accelerated)
-        masked_loss = apply_mask_to_loss(per_token_loss, mask)
-        
-        # Average over selected tokens
-        loss = masked_loss.sum() / max(tokens_selected, 1)
+        # STEP 2: Compute loss ONLY for selected tokens (this is where savings come from!)
+        if tokens_selected > 0:
+            selected_logits = logits_flat[selected_indices]
+            selected_targets = targets_flat[selected_indices]
+            loss = self.base_loss(selected_logits, selected_targets).mean()
+        else:
+            # Fallback: if no tokens selected, use full loss
+            loss = self.base_loss(logits_flat, targets_flat).mean()
+            tokens_selected = num_tokens
         
         # Metrics
         self.metrics = {
@@ -180,29 +175,242 @@ class CGGRLoss(nn.Module):
         return self.metrics.copy()
 
 
-class CGGRWrapper(nn.Module):
+class TruncatedRouter(nn.Module):
     """
-    Legacy wrapper - provides telemetry only.
-    Use CGGRLoss for actual compute savings.
+    Lightweight proxy model for difficulty scoring.
+    Constructed by slicing a full model (sharing weights).
+    """
+    def __init__(self, model: nn.Module, num_layers: int = 2):
+        super().__init__()
+        import copy
+        
+        # Heuristics for common architectures
+        if hasattr(model, 'model'):
+            # Llama/Mistral/Qwen style
+            base_model = model.model
+            self.style = 'llama'
+        elif hasattr(model, 'transformer'):
+            # GPT-2/GPT-J/Falcon style
+            base_model = model.transformer
+            self.style = 'gpt'
+        else:
+            raise ValueError("Unsupported model architecture for automatic truncation. Please provide a custom router.")
+
+        # Clone config and truncate layers
+        config = copy.deepcopy(model.config)
+        if hasattr(config, 'num_hidden_layers'):
+            config.num_hidden_layers = num_layers
+        elif hasattr(config, 'n_layer'):
+            config.n_layer = num_layers
+        
+        # Instantiate mini-model (random weights initially)
+        cls = base_model.__class__
+        self.mini_model = cls(config)
+        
+        # Share weights (Overwrite with references)
+        # 1. Embeddings
+        if hasattr(base_model, 'embed_tokens'):
+            self.mini_model.embed_tokens = base_model.embed_tokens
+        elif hasattr(base_model, 'wte'):
+            self.mini_model.wte = base_model.wte
+            self.mini_model.wpe = getattr(base_model, 'wpe', None)
+            
+        # 2. Layers
+        if hasattr(base_model, 'layers'):
+            for i in range(num_layers):
+                self.mini_model.layers[i] = base_model.layers[i]
+        elif hasattr(base_model, 'h'):
+            for i in range(num_layers):
+                self.mini_model.h[i] = base_model.h[i]
+        
+        # 3. Norm
+        if hasattr(base_model, 'norm'):
+            self.mini_model.norm = base_model.norm
+        elif hasattr(base_model, 'ln_f'):
+            self.mini_model.ln_f = base_model.ln_f
+        
+        # 4. Rotary Embeddings (if present, share reference)
+        if hasattr(base_model, 'rotary_emb'):
+            # For Models that store rotary_emb in the base model
+            self.mini_model.rotary_emb = base_model.rotary_emb
+            
+        # 5. Head (not part of base model usually)
+        self.head = model.lm_head if hasattr(model, 'lm_head') else None
+            
+    def forward(self, input_ids: torch.Tensor, **kwargs):
+        # Forward through mini-base-model
+        # This handles all position_ids, masking, and rotary embeddings correctly!
+        outputs = self.mini_model(input_ids, **kwargs)
+        
+        # Get hidden states
+        hidden_states = outputs[0]
+        
+        # Project to logits using head
+        if self.head is not None:
+            logits = self.head(hidden_states)
+        else:
+            logits = hidden_states
+            
+        return logits
+
+
+def create_truncated_router(model: nn.Module, num_layers: int = 2) -> nn.Module:
+    """Create a lightweight router sharing weights with the main model."""
+    return TruncatedRouter(model, num_layers)
+
+
+class CGGRModel(nn.Module):
+    """
+    Model wrapper with batch splitting for real backward speedup.
+    
+    Uses two-pass forward:
+    1. First forward (Router): Lightweight difficulty scoring (fast)
+    2. Second forward (Main): Only hard tokens → loss → backward (grad)
+    
+    Args:
+        model: Main model
+        router: Optional lightweight model for Pass 1. If None, uses main model.
+               Use create_truncated_router(model) to create one easily.
+        min_tokens_ratio: Target fraction of tokens to keep (default: 0.25)
     """
     
-    def __init__(self, model, **kwargs):
+    def __init__(
+        self,
+        model: nn.Module,
+        router: Optional[nn.Module] = None,
+        min_tokens_ratio: float = 0.25,
+        warmup_steps: int = 1000,
+        dynamic_threshold: bool = True,
+        threshold_sensitivity: float = 0.5,
+    ):
         super().__init__()
         self.model = model
-        self.register_buffer('current_step_count', torch.tensor(0, dtype=torch.long))
-        self.metrics = {}
+        self.router = router if router is not None else model
+        self.min_tokens_ratio = min_tokens_ratio
+        self.warmup_steps = warmup_steps
+        self.dynamic_threshold = dynamic_threshold
+        self.threshold_sensitivity = threshold_sensitivity
         
-        import warnings
-        warnings.warn(
-            "CGGRWrapper is deprecated. Use CGGRLoss for compute savings.",
-            DeprecationWarning
-        )
+        self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
+        self.metrics = {}
     
     def step(self):
-        self.current_step_count += 1
+        """Call after optimizer.step()"""
+        self.step_count += 1
     
-    def forward(self, *args, **kwargs):
-        return self.model(*args, **kwargs)
+    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs):
+        """
+        Two-pass forward with batch splitting.
+        """
+        if labels is None:
+            # Inference mode - just forward main model
+            return self.model(input_ids, **kwargs)
+        
+        batch_size, seq_len = input_ids.shape
+        
+        # =====================================================================
+        # PASS 1: Router forward (fast, no gradients)
+        # =====================================================================
+        with torch.no_grad():
+            # Use router for difficulty scores
+            outputs = self.router(input_ids, **kwargs)
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
+            # Compute difficulty for each token
+            difficulty, confidence, entropy = fused_difficulty_score(logits)
+            
+            # Curriculum: gradually reduce token ratio
+            if self.warmup_steps <= 0:
+                progress = 1.0
+            else:
+                progress = min(1.0, self.step_count.item() / self.warmup_steps)
+            base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
+            
+            # Dynamic threshold adjustment
+            if self.dynamic_threshold:
+                current_ratio = compute_dynamic_threshold(
+                    confidence.view(-1), base_ratio, self.threshold_sensitivity
+                )
+            else:
+                current_ratio = base_ratio
+            
+            # Select hard tokens
+            mask = select_tokens_topk(difficulty, current_ratio)
+            
+            # Get hard token indices
+            hard_mask = mask.view(batch_size, seq_len) > 0.5
+            
+            # Count tokens
+            tokens_total = batch_size * seq_len
+            tokens_selected = hard_mask.sum().item()
+        
+        # =====================================================================
+        # PASS 2: Main model forward (only hard tokens, with gradients)
+        # =====================================================================
+        if tokens_selected > 0:
+            # Alternative: Split by sequence difficulty
+            seq_difficulty = difficulty.mean(dim=-1)  # (batch,)
+            k = max(1, int(batch_size * current_ratio))
+            _, hard_seq_indices = torch.topk(seq_difficulty, k)
+            
+            # Forward only hard sequences
+            hard_input_ids = input_ids[hard_seq_indices]
+            hard_labels = labels[hard_seq_indices]
+            
+            # Forward with gradients through MAIN model
+            hard_outputs = self.model(hard_input_ids, **kwargs)
+            if hasattr(hard_outputs, 'logits'):
+                hard_logits = hard_outputs.logits
+            else:
+                hard_logits = hard_outputs
+            
+            # Compute loss
+            hard_logits_flat = hard_logits[:, :-1, :].contiguous().view(-1, hard_logits.shape[-1])
+            hard_labels_flat = hard_labels[:, 1:].contiguous().view(-1)
+            
+            loss = F.cross_entropy(hard_logits_flat, hard_labels_flat)
+            
+            tokens_selected = hard_seq_indices.numel() * (seq_len - 1)
+        else:
+            # Fallback: full forward through main model
+            outputs = self.model(input_ids, **kwargs)
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
+            logits_flat = logits[:, :-1, :].contiguous().view(-1, logits.shape[-1])
+            labels_flat = labels[:, 1:].contiguous().view(-1)
+            loss = F.cross_entropy(logits_flat, labels_flat)
+            tokens_selected = tokens_total
+        
+        # Metrics
+        self.metrics = {
+            'step': self.step_count.item(),
+            'token_ratio': current_ratio,
+            'tokens_selected': int(tokens_selected),
+            'tokens_total': tokens_total,
+            'sequences_selected': hard_seq_indices.numel() if tokens_selected > 0 else batch_size,
+            'sequences_total': batch_size,
+            'avg_confidence': confidence.mean().item(),
+            'avg_entropy': entropy.mean().item(),
+            'router_used': self.router is not self.model,
+        }
+        
+        return loss
     
-    def get_metrics(self):
-        return self.metrics
+    def get_metrics(self) -> dict:
+        return self.metrics.copy()
+
+
+# Export key components
+__all__ = [
+    'CGGRLoss', 
+    'CGGRModel', 
+    'create_truncated_router', 
+    'TruncatedRouter'
+]
+

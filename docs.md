@@ -51,9 +51,45 @@ CGGR:      loss = CrossEntropy(HARD tokens)    → 25% backward FLOPs
 
 ---
 
-## CGGRLoss API
+## Batch Splitting (Recommended)
 
-### Basic Usage
+The most efficient way to use CGGR is via `CGGRModel`, which implements "Batch Splitting".
+
+### Why?
+- **Speed:** Only runs the backward pass on hard tokens (1.4x - 2x faster).
+- **Efficiency:** Uses a lightweight truncated router (4 layers) to score difficulty.
+
+### Usage
+
+```python
+from cggr import CGGRModel, create_truncated_router
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("...").cuda()
+
+# 1. Create a lightweight router (shares weights with model, 0 extra memory)
+# Uses first 4 layers to estimate difficulty
+router = create_truncated_router(model, num_layers=4)
+
+# 2. Wrap the model
+cggr_model = CGGRModel(
+    model, 
+    router=router,           # Optimized difficulty scoring
+    min_tokens_ratio=0.25,   # Keep top 25% hardest tokens
+    warmup_steps=1000        # Gradually reduce to 25%
+)
+
+# 3. Train as usual
+loss = cggr_model(input_ids, labels=labels)
+loss.backward()
+```
+
+---
+
+## CGGRLoss API (Manual Integration)
+
+If you cannot use `CGGRModel` (e.g. specialized architectures), you can use `CGGRLoss`.
+*Note: This effectively sparsifies gradients but does NOT save backward pass FLOPs unless combined with custom slicing.*
 
 ```python
 from cggr import CGGRLoss

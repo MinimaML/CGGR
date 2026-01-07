@@ -392,6 +392,127 @@ def main():
         result = benchmark_cggr_loss(model, input_ids, labels, criterion)
         results.append(result)
     
+    # 3. CGGRModel with batch splitting (the real speedup)
+    console.print("\n[bold magenta]Benchmarking CGGRModel (batch splitting, 25%)...[/bold magenta]")
+    from cggr import CGGRModel
+    
+    cggr_model = CGGRModel(
+        model, 
+        min_tokens_ratio=0.25,
+        warmup_steps=0,
+    )
+    
+    # Warmup
+    for _ in range(5):
+        loss = cggr_model(input_ids, labels)
+        loss.backward()
+        model.zero_grad()
+        cggr_model.step()
+    
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    cggr_model.step_count.fill_(1000)  # Skip warmup
+    
+    # Benchmark CGGRModel
+    forward_times = []
+    backward_times = []
+    
+    for _ in range(20):
+        model.zero_grad()
+        torch.cuda.synchronize()
+        
+        t0 = time.perf_counter()
+        loss = cggr_model(input_ids, labels)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        
+        loss.backward()
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        
+        forward_times.append((t1 - t0) * 1000)
+        backward_times.append((t2 - t1) * 1000)
+    
+    metrics = cggr_model.get_metrics()
+    results.append(BenchmarkResult(
+        name="CGGRModel (batch split)",
+        forward_ms=sum(forward_times) / len(forward_times),
+        loss_ms=0,  # Loss included in forward for CGGRModel
+        backward_ms=sum(backward_times) / len(backward_times),
+        total_ms=sum(forward_times) / len(forward_times) + sum(backward_times) / len(backward_times),
+        memory_mb=get_memory_mb(),
+        tokens_total=metrics.get('tokens_total', batch_size * seq_len),
+        tokens_selected=metrics.get('tokens_selected', 0),
+        avg_confidence=metrics.get('avg_confidence', 0),
+        avg_entropy=metrics.get('avg_entropy', 0),
+        avg_difficulty=0,
+        difficulty_histogram={},
+    ))
+    
+    # 4. TRUNCATED CGGRModel (Optimized Forward)
+    console.print("\n[bold magenta]Benchmarking CGGRModel (Truncated Router, 25%)...[/bold magenta]")
+    from cggr import create_truncated_router
+    
+    # Create lightweight router (2 layers)
+    router = create_truncated_router(model, num_layers=4)  # 4 layers for better accuracy
+    router.cuda()
+    
+    truncated_model = CGGRModel(
+        model, 
+        router=router,
+        min_tokens_ratio=0.25,
+        warmup_steps=0,
+    )
+    
+    # Warmup
+    for _ in range(5):
+        loss = truncated_model(input_ids, labels)
+        loss.backward()
+        model.zero_grad()
+        truncated_model.step()
+    
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    truncated_model.step_count.fill_(1000)
+    
+    # Benchmark
+    forward_times = []
+    backward_times = []
+    
+    for _ in range(20):
+        model.zero_grad()
+        torch.cuda.synchronize()
+        
+        t0 = time.perf_counter()
+        loss = truncated_model(input_ids, labels)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        
+        loss.backward()
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        
+        forward_times.append((t1 - t0) * 1000)
+        backward_times.append((t2 - t1) * 1000)
+    
+    metrics = truncated_model.get_metrics()
+    results.append(BenchmarkResult(
+        name="CGGRModel (Truncated)",
+        forward_ms=sum(forward_times) / len(forward_times),
+        loss_ms=0,
+        backward_ms=sum(backward_times) / len(backward_times),
+        total_ms=sum(forward_times) / len(forward_times) + sum(backward_times) / len(backward_times),
+        memory_mb=get_memory_mb(),
+        tokens_total=metrics.get('tokens_total', batch_size * seq_len),
+        tokens_selected=metrics.get('tokens_selected', 0),
+        avg_confidence=metrics.get('avg_confidence', 0),
+        avg_entropy=metrics.get('avg_entropy', 0),
+        avg_difficulty=0,
+        difficulty_histogram={},
+    ))
+    
     # Print results
     console.print("\n")
     console.print("=" * 50)
@@ -410,3 +531,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
