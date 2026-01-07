@@ -13,7 +13,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/MinimaML/CGGR",
     author="MinimaML",
-    py_modules=["cggr"],
+    py_modules=["cggr", "triton_kernels"],
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
@@ -29,5 +29,8 @@ setup(
         "torch>=2.0.0",
         "numpy",
     ],
+    extras_require={
+        "triton": ["triton>=2.0.0"],
+    },
     python_requires=">=3.8",
 )
