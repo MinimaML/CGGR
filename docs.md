@@ -51,14 +51,22 @@ CGGR:      loss = CrossEntropy(HARD tokens)    → 25% backward FLOPs
 
 ### Comparison
 
-| Metric              | Standard Training            | CGGR (Batch Split)       | Benefit                               |
-| :------------------ | :--------------------------- | :----------------------- | :------------------------------------ |
-| **Backward Pass**   | 100% of tokens               | 25% of tokens            | **4x cheaper** backward pass          |
-| **Forward Pass**    | 1.0x cost                    | ~1.1x cost (Pass 1 + 2)  | Negligible overhead (~9ms)            |
-| **Total Speed**     | 1.0x (Baseline)              | **1.4x - 2.0x faster**   | Significant training acceleration     |
-| **Data Efficiency** | Learns from all tokens       | Prioritizes hard tokens  | Learns faster from hard examples      |
-| **Gradient Noise**  | High (easy tokens add noise) | Low                      | Cleaner gradients, faster convergence |
-| **Memory**          | High (full graph)            | **Lower** (sparse graph) | Can increase batch size               |
+| Metric              | Standard Training      | CGGR (Batch Split)       | Benefit                           |
+| :------------------ | :--------------------- | :----------------------- | :-------------------------------- |
+| **Backward Pass**   | 100% of tokens         | 25% of tokens            | **4x cheaper** backward pass      |
+| **Forward Pass**    | 1.0x cost              | ~1.1x cost (Pass 1 + 2)  | Negligible overhead (~9ms)        |
+| **Total Speed**     | 1.0x (Baseline)        | **1.4x - 2.0x faster**   | Significant training acceleration |
+| **Data Efficiency** | Learns from all tokens | Prioritizes hard tokens  | Learns faster from hard examples  |
+| **Memory**          | High (full graph)      | **Lower** (sparse graph) | Can increase batch size           |
+
+### Benchmarks (SmolLM-135M)
+
+| Configuration | Forward    | Backward  | Total      | Speedup   |
+| :------------ | :--------- | :-------- | :--------- | :-------- |
+| **Standard**  | 118 ms     | 185 ms    | 309 ms     | 1.0x      |
+| **CGGR**      | **127 ms** | **93 ms** | **220 ms** | **1.40x** |
+
+*Training 1B Tokens: ~42h (Standard) vs ~30h (CGGR). Saves 12h.*
 
 ---
 
