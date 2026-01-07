@@ -25,7 +25,7 @@ MANIFEST
 venv/
 env/
 ENV/
-
+.env
 # OS
 .DS_Store
 Thumbs.db
