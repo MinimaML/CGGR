@@ -30,7 +30,7 @@ pip install cggr
 %%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '16px'}}}%%
 xychart-beta
     title "Training Step Time (Lower is Better)"
-    x-axis [Standard, CGGR (Optimized)]
+    x-axis ["Standard", "CGGR (Optimized)"]
     y-axis "Time (ms)" 0 --> 350
     bar [309, 220]
 ```
