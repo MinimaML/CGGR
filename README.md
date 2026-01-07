@@ -71,22 +71,18 @@ The wrapper registers a buffer for the step count, so the curriculum state is au
 
 ## Triton Acceleration
 
-CGGR automatically uses **fused Triton kernels** when available, providing:
+CGGR uses **fused Triton kernels** for maximum performance:
 
 - **3x faster difficulty scoring**: Single kernel for softmax → entropy → confidence
 - **O(n) bucket assignment**: Percentile-based instead of O(n log n) sort
 - **Fused gradient masking**: Custom autograd with Triton backward
 
-Install with Triton support:
 ```bash
-pip install cggr[triton]
+pip install cggr
 ```
 
-The library auto-detects Triton availability:
-```python
-model = CGGRWrapper(model, num_buckets=4, warmup_steps=1000)
-print(model.get_metrics())  # Shows 'triton_enabled': True/False
-```
+> [!IMPORTANT]
+> Triton is required. CGGR is designed for CUDA training only.
 
 ## Compatibility
 
@@ -94,4 +90,4 @@ CGGR is designed for **Transformer-based LLMs** (Llama, Mistral, GPT), but it wa
 
 *   **SRDE Optimization**: When combined with SRDE, CGGR enables "Double Sparsity", sparsifying both the forward pass (via MoE routing) and the backward pass (via Gradient Routing). This combination yields the theoretical maximum training efficiency.
 *   **Dense Models**: Works out of the box for standard Transformers.
-*   **Fallback**: Automatically falls back to PyTorch ops when Triton is unavailable.
+*   **Requirements**: CUDA GPU + Triton. CPU training not supported.
