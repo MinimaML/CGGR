@@ -1,93 +1,71 @@
 # Confidence-Gated Gradient Routing (CGGR)
 
-CGGR is a PyTorch library that implements Multi-Stage Gradient Routing for Transformer models. It selectively stops gradient backpropagation for tokens based on their confidence and entropy, effectively reducing the compute required for the backward pass.
+CGGR is a PyTorch library that provides **selective loss computation** for Transformer training. By excluding easy tokens from loss, gradients are only computed for hard tokens - providing actual backward pass savings.
 
-## Mechanism
-
-### Gradient Routing
-The library identifies tokens as "easy" or "hard" based on a difficulty score derived from the model's output logits.
-$$D_t = \text{Entropy}(P_t) - \text{Confidence}(P_t)$$
-
-- **Hard Tokens**: Gradients propagate through all layers.
-- **Easy Tokens**: Gradients are blocked at earlier layers (e.g., top 25% or 50% of the model).
-
-This is achieved by registering backward hooks on specific layers that multiply gradients by a binary mask (0 or 1).
-
-### Multi-Stage Bucketing
-Tokens are sorted by difficulty and assigned to "buckets" which correspond to different gradient depths.
-
-| Bucket | Difficulty  | Gradient Depth    |
-| :----- | :---------- | :---------------- |
-| **0**  | Highest     | 100% (All Layers) |
-| **1**  | Medium-High | 75%               |
-| **2**  | Medium-Low  | 50%               |
-| **3**  | Lowest      | 25%               |
-
-### Curriculum Learning
-To ensure training stability, the system uses a linear warmup. Initially, all tokens are processed at full depth. Over a specified number of `warmup_steps`, the system gradually enables the shallower gradient paths.
-
-## Usage
-
-The `CGGRWrapper` class wraps an existing PyTorch module. It automatically detects the Transformer layer stack and injects the necessary hooks.
+## Quick Start
 
 ```python
-import torch
-from cggr import CGGRWrapper
-from my_model import MyTransformer
+from cggr import CGGRLoss
 
-# 1. Initialize your standard model
-model = MyTransformer(...)
-
-# 2. Wrap with CGGR
-# num_buckets: Number of depth tiers (e.g., 4)
-# warmup_steps: Number of steps to reach target efficiency
-model = CGGRWrapper(model, num_buckets=4, warmup_steps=1000)
-
-# 3. Training Loop
-optimizer = torch.optim.Adam(model.parameters())
+# Replace your loss function
+criterion = CGGRLoss(min_tokens_ratio=0.25, warmup_steps=1000)
 
 for batch in dataloader:
-    # Forward pass
-    logits = model(input_ids) 
-    loss = criterion(logits, targets)
+    logits = model(input_ids)
     
-    # Backward pass with dynamic routing
-    loss.backward() 
+    # Only hard tokens contribute to loss and backprop
+    loss = criterion(logits, targets)
+    loss.backward()
     
     optimizer.step()
+    criterion.step()
     
-    # Update curriculum state
-    model.step()
+    print(criterion.get_metrics())  # tokens_used, avg_confidence, etc.
 ```
 
-## Configuration Options
+## How It Works
 
-- **`num_buckets`**: Number of efficiency tiers.
-- **`warmup_steps`**: Length of the curriculum warmup phase.
-- **`leak_rate`**: (Optional) Allows a fraction of gradients to pass through stopped paths. Default is 0.0.
+### Token Selection
+Each token gets a **difficulty score** based on model confidence:
+$$D_t = \text{Entropy}(P_t) - \text{Confidence}(P_t)$$
 
-## Persistence
-The wrapper registers a buffer for the step count, so the curriculum state is automatically saved and loaded with `model.state_dict()`.
+High difficulty = model is uncertain → include in loss
+Low difficulty = model is confident → exclude from loss
 
-## Triton Acceleration
+### Curriculum Learning
+Starts with all tokens, gradually reduces to `min_tokens_ratio`:
+- Step 0: 100% of tokens in loss
+- Step N (warmup): `min_tokens_ratio` of tokens (e.g., 25%)
 
-CGGR uses **fused Triton kernels** for maximum performance:
+### Actual Compute Savings
+Unlike gradient masking (which adds overhead), excluding tokens from loss **prevents gradient computation entirely**:
 
-- **3x faster difficulty scoring**: Single kernel for softmax → entropy → confidence
-- **O(n) bucket assignment**: Percentile-based instead of O(n log n) sort
-- **Fused gradient masking**: Custom autograd with Triton backward
+| Approach           | Backward FLOPs | Overhead |
+| ------------------ | -------------- | -------- |
+| Gradient Hooks     | 100%           | +4%      |
+| **Selective Loss** | **25-75%**     | **~0%**  |
+
+## Configuration
+
+```python
+CGGRLoss(
+    base_loss=nn.CrossEntropyLoss(reduction='none'),  # Any per-token loss
+    min_tokens_ratio=0.25,  # Target: 25% of tokens
+    warmup_steps=1000,      # Steps to reach target
+)
+```
+
+## Compatibility
+
+- **Triton Required**: CUDA GPU with Triton for fused difficulty scoring
+- **Any Transformer**: Works with any model that outputs logits
+- **SRDE Optimized**: "Double Sparsity" - sparse forward (MoE) + sparse backward (CGGR)
+
+## Installation
 
 ```bash
 pip install cggr
 ```
 
 > [!IMPORTANT]
-> Triton is required. CGGR is designed for CUDA training only.
-
-## Compatibility
-
-CGGR is designed for **Transformer-based LLMs** (Llama, Mistral, GPT), but it was specifically engineered to work best with SRDE (Sparse Routed Delta Experts).
-
-*   **SRDE Optimization**: When combined with SRDE, CGGR enables "Double Sparsity", sparsifying both the forward pass (via MoE routing) and the backward pass (via Gradient Routing). This combination yields the theoretical maximum training efficiency.
-*   **Dense Models**: Works out of the box for standard Transformers.
-*   **Requirements**: CUDA GPU + Triton. CPU training not supported.
+> Requires CUDA GPU and Triton. CPU training not supported.

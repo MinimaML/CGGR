@@ -1,35 +1,118 @@
 """
 CGGR - Confidence-Gated Gradient Routing
 =========================================
-A PyTorch library for selective gradient routing based on token difficulty.
-Uses Triton kernels for CUDA acceleration.
+Selective loss computation based on token difficulty.
+Only hard tokens contribute to loss, so easy tokens don't generate gradients.
 
-Strategy: Uses logits from the PREVIOUS step to route gradients for the CURRENT step.
-This avoids needing a second forward pass while still providing adaptive routing.
+This provides ACTUAL compute savings by excluding easy tokens from backprop entirely.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from triton_kernels import (
-    triton_fused_difficulty_score,
-    triton_bucket_assign,
-    TritonGradientMask,
-)
+from triton_kernels import triton_fused_difficulty_score
+
+
+class CGGRLoss(nn.Module):
+    """
+    Wraps a loss function with difficulty-based token selection.
+    Only tokens above the difficulty threshold contribute to loss.
+    
+    Args:
+        base_loss: Loss function to wrap (default: CrossEntropyLoss with reduction='none')
+        min_tokens_ratio: Minimum fraction of tokens to include (default: 0.25)
+        warmup_steps: Steps to reach target sparsity (default: 1000)
+    """
+    
+    def __init__(
+        self, 
+        base_loss: nn.Module = None,
+        min_tokens_ratio: float = 0.25,
+        warmup_steps: int = 1000,
+    ):
+        super().__init__()
+        self.base_loss = base_loss or nn.CrossEntropyLoss(reduction='none')
+        self.min_tokens_ratio = min_tokens_ratio
+        self.warmup_steps = warmup_steps
+        
+        self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
+        self.metrics = {}
+    
+    def step(self):
+        """Call after optimizer.step()"""
+        self.step_count += 1
+    
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Compute loss only for hard tokens.
+        
+        Args:
+            logits: (batch, seq, vocab) or (batch*seq, vocab)
+            targets: (batch, seq) or (batch*seq,)
+        
+        Returns:
+            Scalar loss averaged over selected tokens
+        """
+        # Flatten if needed
+        if logits.dim() == 3:
+            batch, seq, vocab = logits.shape
+            logits_flat = logits.view(-1, vocab)
+            targets_flat = targets.view(-1)
+        else:
+            logits_flat = logits
+            targets_flat = targets
+            batch, seq = 1, logits.shape[0]
+        
+        num_tokens = logits_flat.shape[0]
+        
+        # Compute per-token loss
+        per_token_loss = self.base_loss(logits_flat, targets_flat)
+        
+        # Compute difficulty scores (Triton-accelerated)
+        with torch.no_grad():
+            difficulty, confidence, entropy = triton_fused_difficulty_score(
+                logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat
+            )
+            difficulty = difficulty.view(-1)
+            
+            # Curriculum: gradually reduce token ratio
+            progress = min(1.0, self.step_count.item() / max(1, self.warmup_steps))
+            current_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
+            
+            # Select top-k hardest tokens
+            k = max(1, int(num_tokens * current_ratio))
+            _, hard_indices = torch.topk(difficulty, k)
+            
+            # Create mask
+            mask = torch.zeros(num_tokens, device=logits.device, dtype=logits.dtype)
+            mask[hard_indices] = 1.0
+        
+        # Masked loss (only hard tokens contribute)
+        masked_loss = per_token_loss * mask
+        loss = masked_loss.sum() / mask.sum()
+        
+        # Metrics
+        self.metrics = {
+            'step': self.step_count.item(),
+            'token_ratio': current_ratio,
+            'tokens_used': k,
+            'tokens_total': num_tokens,
+            'avg_confidence': confidence.mean().item(),
+            'avg_masked_loss': loss.item(),
+        }
+        
+        return loss
+    
+    def get_metrics(self) -> dict:
+        return self.metrics.copy()
 
 
 class CGGRWrapper(nn.Module):
     """
-    Wraps a Transformer model with Confidence-Gated Gradient Routing.
-    
-    Uses the previous step's difficulty scores to route gradients for the current step.
-    This is a one-step-delayed routing that avoids extra forward passes.
-    
-    Args:
-        model: The model to wrap (must have a ModuleList of transformer layers)
-        num_buckets: Number of gradient depth tiers (default: 4)
-        warmup_steps: Steps to gradually enable routing (default: 1000)
-        leak_rate: Fraction of gradient to leak through blocked paths (default: 0.0)
+    Legacy wrapper for backward compatibility.
+    Now just provides telemetry without gradient routing overhead.
+    Use CGGRLoss for actual compute savings.
     """
     
     def __init__(
@@ -43,87 +126,23 @@ class CGGRWrapper(nn.Module):
         self.model = model
         self.num_buckets = num_buckets
         self.warmup_steps = warmup_steps
-        self.leak_rate = leak_rate
         
-        # Persistence
         self.register_buffer('current_step_count', torch.tensor(0, dtype=torch.long))
-        
-        # Detect transformer layers
-        self.layer_module_list = self._detect_transformer_layers(model)
-        if not self.layer_module_list:
-            raise ValueError("Could not detect Transformer layer stack")
-        self.num_layers = len(self.layer_module_list)
-        
-        # Pre-compute bucket -> stop_layer
-        self._bucket_stop_layers = self._compute_bucket_stop_layers()
-        
-        # Cutoff layers
-        self._cutoff_layers = sorted(set(
-            sl for sl in self._bucket_stop_layers if sl >= 0
-        ))
-        
-        # Routing state: stop layers for NEXT forward pass (from previous step)
-        self._pending_stop_layers = None
-        self._active_stop_layers = None  # Currently being used
-        
-        # Register forward hooks
-        for layer_idx in self._cutoff_layers:
-            self._register_gradient_gate(layer_idx)
-        
         self.metrics = {}
-    
-    def _compute_bucket_stop_layers(self) -> list:
-        chunk_size = self.num_layers / self.num_buckets
-        stop_layers = []
-        for b_idx in range(self.num_buckets):
-            layers_to_keep = int(chunk_size * (self.num_buckets - b_idx))
-            stop_layer = self.num_layers - layers_to_keep - 1
-            stop_layers.append(stop_layer)
-        return stop_layers
-    
-    def _register_gradient_gate(self, layer_idx: int):
-        target_layer = self.layer_module_list[layer_idx]
-        leak_rate = self.leak_rate
         
-        def forward_hook(module, inp, out):
-            if not self.training or self._active_stop_layers is None:
-                return out
-            
-            tensor = out[0] if isinstance(out, tuple) else out
-            if not isinstance(tensor, torch.Tensor):
-                return out
-            
-            masked = TritonGradientMask.apply(
-                tensor, self._active_stop_layers, layer_idx, leak_rate
-            )
-            
-            if isinstance(out, tuple):
-                return (masked,) + out[1:]
-            return masked
-        
-        target_layer.register_forward_hook(forward_hook)
-    
-    def _detect_transformer_layers(self, model):
-        largest = None
-        max_len = 0
-        for name, module in model.named_modules():
-            if isinstance(module, nn.ModuleList) and len(module) > max_len:
-                max_len = len(module)
-                largest = module
-        return largest
+        import warnings
+        warnings.warn(
+            "CGGRWrapper adds overhead without compute savings. "
+            "Use CGGRLoss for actual backward speedup.",
+            DeprecationWarning
+        )
     
     def step(self):
-        """Call after optimizer.step() to advance routing state."""
         self.current_step_count += 1
-        # Promote pending routing to active for next forward
-        self._active_stop_layers = self._pending_stop_layers
-        self._pending_stop_layers = None
     
     def forward(self, *args, **kwargs):
-        # Run forward with current routing
         output = self.model(*args, **kwargs)
         
-        # Extract logits
         if isinstance(output, torch.Tensor):
             logits = output
         elif hasattr(output, 'logits'):
@@ -133,27 +152,14 @@ class CGGRWrapper(nn.Module):
         else:
             return output
         
-        if logits is None or not self.training:
-            return output
-        
-        # Compute routing for NEXT step based on this step's difficulty
-        with torch.no_grad():
-            progress = min(1.0, self.current_step_count.item() / max(1, self.warmup_steps))
-            difficulty, conf, ent = triton_fused_difficulty_score(logits)
-            
-            self._pending_stop_layers = triton_bucket_assign(
-                difficulty, self.num_buckets, self.num_layers, progress
-            )
-            
-            self.metrics = {
-                'step': self.current_step_count.item(),
-                'routing_active': self._active_stop_layers is not None,
-                'avg_confidence': conf.mean().item(),
-                'avg_entropy': ent.mean().item(),
-            }
-            
-            if self._active_stop_layers is not None:
-                self.metrics['avg_stop_layer'] = self._active_stop_layers.float().mean().item()
+        if logits is not None and self.training:
+            with torch.no_grad():
+                difficulty, conf, ent = triton_fused_difficulty_score(logits)
+                self.metrics = {
+                    'step': self.current_step_count.item(),
+                    'avg_confidence': conf.mean().item(),
+                    'avg_entropy': ent.mean().item(),
+                }
         
         return output
     
