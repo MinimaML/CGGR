@@ -310,6 +310,7 @@ def print_results(results: List[BenchmarkResult], baseline: BenchmarkResult):
 
 def main():
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from datasets import load_dataset
     from cggr import CGGRLoss
     
     console.print("[bold cyan]CGGR Benchmark Suite[/bold cyan]")
@@ -333,14 +334,38 @@ def main():
     console.print(f"[green]✓ Model loaded: {sum(p.numel() for p in model.parameters()):,} params[/green]")
     console.print()
     
-    # Create synthetic batch
+    # Load real data from FineWeb-Edu
+    console.print("[yellow]Loading FineWeb-Edu (streaming)...[/yellow]")
+    dataset = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        split="train",
+        streaming=True,
+    )
+    
     batch_size = 4
     seq_len = 512
     
-    console.print(f"[yellow]Creating batch: {batch_size}x{seq_len} = {batch_size * seq_len:,} tokens[/yellow]")
+    # Get real text samples
+    texts = []
+    for i, sample in enumerate(dataset):
+        if i >= batch_size:
+            break
+        texts.append(sample['text'][:seq_len * 4])  # Get enough text
     
-    input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device='cuda')
+    # Tokenize
+    encodings = tokenizer(
+        texts,
+        truncation=True,
+        max_length=seq_len,
+        padding='max_length',
+        return_tensors='pt',
+    )
+    input_ids = encodings['input_ids'].cuda()
     labels = input_ids.clone()
+    
+    console.print(f"[green]✓ Loaded {batch_size}x{seq_len} = {batch_size * seq_len:,} real tokens[/green]")
+    console.print()
     
     # Benchmark configurations
     results = []
