@@ -123,7 +123,11 @@ class CGGRLoss(nn.Module):
                 entropy = entropy.view(-1)
             
             # Compute current ratio with curriculum
-            progress = min(1.0, self.step_count.item() / max(1, self.warmup_steps))
+            if self.warmup_steps <= 0:
+                # No warmup - use target ratio immediately
+                progress = 1.0
+            else:
+                progress = min(1.0, self.step_count.item() / self.warmup_steps)
             base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
             
             # Dynamic threshold adjustment

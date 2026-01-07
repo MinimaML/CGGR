@@ -1,284 +1,180 @@
 """
-CGGR Triton Kernels - Advanced Version
-=======================================
+CGGR Triton Kernels - With PyTorch Fallback
+============================================
 Fused CUDA kernels for Confidence-Gated Gradient Routing.
-Includes multi-strategy scoring, dynamic thresholds, and stratified sampling.
+Falls back to PyTorch ops when Triton isn't available.
 """
 
 import torch
-import triton
-import triton.language as tl
+import torch.nn.functional as F
+
+# Try to import Triton
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+    triton = None
+    tl = None
 
 
 # =============================================================================
-# DIFFICULTY SCORING KERNELS
+# TRITON KERNELS (only defined if Triton available)
 # =============================================================================
 
-@triton.jit
-def _fused_scoring_kernel(
-    logits_ptr,
-    targets_ptr,
-    difficulty_ptr,
-    confidence_ptr,
-    entropy_ptr,
-    vocab_size: tl.constexpr,
-    has_targets: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Fused kernel computing entropy, confidence, margin, and optionally loss-based difficulty.
-    Outputs all metrics so caller can combine as needed.
-    """
-    row_idx = tl.program_id(0)
-    row_start = row_idx * vocab_size
-    
-    # Pass 1: Find max for numerical stability
-    max_val = float('-inf')
-    for block_start in range(0, vocab_size, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < vocab_size
-        vals = tl.load(logits_ptr + row_start + offsets, mask=mask, other=float('-inf'))
-        max_val = tl.maximum(max_val, tl.max(vals, axis=0))
-    
-    # Pass 2: Compute exp sum
-    exp_sum = 0.0
-    for block_start in range(0, vocab_size, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < vocab_size
-        vals = tl.load(logits_ptr + row_start + offsets, mask=mask, other=float('-inf'))
-        exp_vals = tl.exp(vals - max_val)
-        exp_sum += tl.sum(exp_vals, axis=0)
-    
-    # Pass 3: Compute entropy, confidence (max prob), and second-best prob (for margin)
-    entropy_acc = 0.0
-    top1_prob = 0.0
-    top2_prob = 0.0
-    
-    for block_start in range(0, vocab_size, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < vocab_size
-        vals = tl.load(logits_ptr + row_start + offsets, mask=mask, other=float('-inf'))
-        exp_vals = tl.exp(vals - max_val)
-        probs = exp_vals / exp_sum
+if HAS_TRITON:
+    @triton.jit
+    def _fused_scoring_kernel(
+        logits_ptr,
+        targets_ptr,
+        difficulty_ptr,
+        confidence_ptr,
+        entropy_ptr,
+        vocab_size: tl.constexpr,
+        has_targets: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused kernel for entropy, confidence, and difficulty scoring."""
+        row_idx = tl.program_id(0)
+        row_start = row_idx * vocab_size
         
-        # Entropy
-        log_probs = tl.log(probs + 1e-10)
-        entropy_acc += tl.sum(-probs * log_probs, axis=0)
+        # Pass 1: Find max for stability
+        max_val = float('-inf')
+        for block_start in range(0, vocab_size, BLOCK_SIZE):
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < vocab_size
+            vals = tl.load(logits_ptr + row_start + offsets, mask=mask, other=float('-inf'))
+            max_val = tl.maximum(max_val, tl.max(vals, axis=0))
         
-        # Track top-2 probs for margin
-        block_max = tl.max(probs, axis=0)
-        if block_max > top1_prob:
-            top2_prob = top1_prob
-            top1_prob = block_max
-        elif block_max > top2_prob:
-            top2_prob = block_max
-    
-    # Confidence = top1_prob
-    confidence = top1_prob
-    
-    # Margin-based difficulty: smaller margin = harder
-    margin = top1_prob - top2_prob
-    margin_difficulty = 1.0 - margin
-    
-    # Entropy-based difficulty
-    entropy_difficulty = entropy_acc
-    
-    # Combined difficulty: entropy + margin (normalized)
-    # Higher = harder
-    difficulty = entropy_difficulty + margin_difficulty
-    
-    # If we have targets, add loss-based component
-    if has_targets:
-        target_idx = tl.load(targets_ptr + row_idx)
-        target_logit = tl.load(logits_ptr + row_start + target_idx)
-        log_sum_exp = tl.log(exp_sum) + max_val
-        nll = log_sum_exp - target_logit  # Negative log likelihood
-        difficulty = difficulty + nll  # Add loss component
-    
-    tl.store(difficulty_ptr + row_idx, difficulty)
-    tl.store(confidence_ptr + row_idx, confidence)
-    tl.store(entropy_ptr + row_idx, entropy_acc)
-
-
-@triton.jit
-def _compute_batch_stats_kernel(
-    values_ptr,
-    mean_ptr,
-    num_tokens: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Compute mean of values for dynamic thresholding."""
-    acc = 0.0
-    for block_start in range(0, num_tokens, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < num_tokens
-        vals = tl.load(values_ptr + offsets, mask=mask, other=0.0)
-        acc += tl.sum(vals, axis=0)
-    
-    mean = acc / num_tokens
-    tl.store(mean_ptr, mean)
-
-
-@triton.jit
-def _stratified_select_kernel(
-    difficulty_ptr,
-    output_mask_ptr,
-    num_tokens: tl.constexpr,
-    num_strata: tl.constexpr,
-    total_select: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Stratified sampling: divide tokens into difficulty buckets and sample from each.
-    Each block handles selection for one stratum.
-    """
-    stratum_idx = tl.program_id(0)
-    
-    # Compute stratum boundaries (divide difficulty range into equal parts)
-    # Stratum 0 = hardest, Stratum N-1 = easiest
-    stratum_lower = stratum_idx / num_strata
-    stratum_upper = (stratum_idx + 1) / num_strata
-    
-    # Tokens per stratum (weighted: harder strata get more)
-    # Weight: stratum 0 gets 40%, stratum 1 gets 30%, etc.
-    weight = (num_strata - stratum_idx) / ((num_strata * (num_strata + 1)) // 2)
-    tokens_for_stratum = tl.floor(total_select * weight).to(tl.int32)
-    tokens_for_stratum = tl.maximum(tokens_for_stratum, 1)
-    
-    # Find tokens in this stratum and mark top ones
-    count = 0
-    for block_start in range(0, num_tokens, BLOCK_SIZE):
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < num_tokens
+        # Pass 2: Compute exp sum
+        exp_sum = 0.0
+        for block_start in range(0, vocab_size, BLOCK_SIZE):
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < vocab_size
+            vals = tl.load(logits_ptr + row_start + offsets, mask=mask, other=float('-inf'))
+            exp_vals = tl.exp(vals - max_val)
+            exp_sum += tl.sum(exp_vals, axis=0)
         
-        difficulty = tl.load(difficulty_ptr + offsets, mask=mask, other=0.0)
+        # Pass 3: Compute entropy and confidence
+        entropy_acc = 0.0
+        top1_prob = 0.0
         
-        # Normalize difficulty to [0, 1] for stratum assignment
-        # Assume difficulty roughly in [-2, 4] range
-        normalized = (difficulty + 2.0) / 6.0
-        normalized = tl.maximum(0.0, tl.minimum(1.0, normalized))
+        for block_start in range(0, vocab_size, BLOCK_SIZE):
+            offsets = block_start + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < vocab_size
+            vals = tl.load(logits_ptr + row_start + offsets, mask=mask, other=float('-inf'))
+            exp_vals = tl.exp(vals - max_val)
+            probs = exp_vals / exp_sum
+            
+            log_probs = tl.log(probs + 1e-10)
+            entropy_acc += tl.sum(-probs * log_probs, axis=0)
+            block_max = tl.max(probs, axis=0)
+            top1_prob = tl.maximum(top1_prob, block_max)
         
-        # Check if in this stratum
-        in_stratum = (normalized >= stratum_lower) & (normalized < stratum_upper)
+        difficulty = entropy_acc - top1_prob
         
-        # Mark tokens (simple: mark first N in stratum)
-        should_mark = in_stratum & (count < tokens_for_stratum)
-        count += tl.sum(should_mark.to(tl.int32), axis=0)
+        if has_targets:
+            target_idx = tl.load(targets_ptr + row_idx)
+            target_logit = tl.load(logits_ptr + row_start + target_idx)
+            log_sum_exp = tl.log(exp_sum) + max_val
+            nll = log_sum_exp - target_logit
+            difficulty = difficulty + nll
         
-        # Atomic OR to set mask bits (1 = selected)
-        current_mask = tl.load(output_mask_ptr + offsets, mask=mask, other=0.0)
-        new_mask = tl.where(should_mark, 1.0, current_mask)
-        tl.store(output_mask_ptr + offsets, new_mask, mask=mask)
-
-
-@triton.jit
-def _sequence_aware_select_kernel(
-    difficulty_ptr,
-    mask_ptr,
-    batch_size: tl.constexpr,
-    seq_len: tl.constexpr,
-    min_per_seq: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Ensure minimum token coverage per sequence.
-    Each program handles one sequence.
-    """
-    seq_idx = tl.program_id(0)
-    seq_start = seq_idx * seq_len
-    
-    # Count currently selected tokens in this sequence
-    selected_count = 0
-    for block_start in range(0, seq_len, BLOCK_SIZE):
-        offsets = seq_start + block_start + tl.arange(0, BLOCK_SIZE)
-        mask_valid = (block_start + tl.arange(0, BLOCK_SIZE)) < seq_len
-        vals = tl.load(mask_ptr + offsets, mask=mask_valid, other=0.0)
-        selected_count += tl.sum((vals > 0.5).to(tl.int32), axis=0)
-    
-    # If we have enough, done
-    if selected_count >= min_per_seq:
-        return
-    
-    # Need to add more tokens - find hardest unselected ones
-    need = min_per_seq - selected_count
-    
-    for block_start in range(0, seq_len, BLOCK_SIZE):
-        offsets = seq_start + block_start + tl.arange(0, BLOCK_SIZE)
-        pos_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask_valid = pos_offsets < seq_len
-        
-        difficulty = tl.load(difficulty_ptr + offsets, mask=mask_valid, other=-1000.0)
-        current_mask = tl.load(mask_ptr + offsets, mask=mask_valid, other=0.0)
-        
-        # Find unselected tokens with high difficulty
-        is_unselected = current_mask < 0.5
-        
-        # Mark unselected tokens (simple approach: mark hardest first)
-        # For simplicity, just mark first `need` unselected tokens
-        should_mark = is_unselected & (need > 0)
-        added = tl.sum(should_mark.to(tl.int32), axis=0)
-        need = need - added
-        
-        new_mask = tl.where(should_mark, 1.0, current_mask)
-        tl.store(mask_ptr + offsets, new_mask, mask=mask_valid)
-
-
-@triton.jit
-def _topk_select_kernel(
-    difficulty_ptr,
-    mask_ptr,
-    threshold,
-    num_tokens: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Simple top-k selection by threshold."""
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask_valid = offsets < num_tokens
-    
-    difficulty = tl.load(difficulty_ptr + offsets, mask=mask_valid, other=-1000.0)
-    
-    # Select if difficulty >= threshold
-    selected = difficulty >= threshold
-    tl.store(mask_ptr + offsets, selected.to(tl.float32), mask=mask_valid)
-
-
-@triton.jit
-def _apply_mask_to_loss_kernel(
-    loss_ptr,
-    mask_ptr,
-    output_ptr,
-    num_tokens: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Apply selection mask to per-token loss."""
-    pid = tl.program_id(0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask_valid = offsets < num_tokens
-    
-    loss = tl.load(loss_ptr + offsets, mask=mask_valid, other=0.0)
-    selection_mask = tl.load(mask_ptr + offsets, mask=mask_valid, other=0.0)
-    
-    masked_loss = loss * selection_mask
-    tl.store(output_ptr + offsets, masked_loss, mask=mask_valid)
+        tl.store(difficulty_ptr + row_idx, difficulty)
+        tl.store(confidence_ptr + row_idx, top1_prob)
+        tl.store(entropy_ptr + row_idx, entropy_acc)
 
 
 # =============================================================================
-# PYTHON WRAPPERS
+# PYTORCH FALLBACK IMPLEMENTATIONS
+# =============================================================================
+
+def _pytorch_difficulty_score(logits: torch.Tensor, targets: torch.Tensor = None):
+    """PyTorch implementation of difficulty scoring."""
+    probs = F.softmax(logits, dim=-1)
+    confidence, _ = torch.max(probs, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+    
+    difficulty = entropy - confidence
+    
+    if targets is not None:
+        # Add NLL component
+        nll = F.cross_entropy(
+            logits.view(-1, logits.shape[-1]),
+            targets.view(-1),
+            reduction='none'
+        ).view(logits.shape[:-1])
+        difficulty = difficulty + nll
+    
+    return difficulty, confidence, entropy
+
+
+def _pytorch_select_topk(difficulty: torch.Tensor, ratio: float) -> torch.Tensor:
+    """PyTorch top-k selection."""
+    flat = difficulty.view(-1)
+    k = max(1, int(flat.numel() * ratio))
+    _, indices = torch.topk(flat, k)
+    mask = torch.zeros_like(flat)
+    mask[indices] = 1.0
+    return mask.view(difficulty.shape)
+
+
+def _pytorch_stratified_select(
+    difficulty: torch.Tensor, 
+    total_ratio: float, 
+    num_strata: int = 4
+) -> torch.Tensor:
+    """PyTorch stratified selection."""
+    flat = difficulty.view(-1)
+    num_tokens = flat.numel()
+    total_select = int(num_tokens * total_ratio)
+    
+    # Sort by difficulty
+    sorted_idx = torch.argsort(flat, descending=True)
+    
+    # Divide into strata and sample from each
+    mask = torch.zeros_like(flat)
+    tokens_per_stratum = total_select // num_strata
+    stratum_size = num_tokens // num_strata
+    
+    for i in range(num_strata):
+        start = i * stratum_size
+        end = start + stratum_size if i < num_strata - 1 else num_tokens
+        stratum_indices = sorted_idx[start:end]
+        
+        # Take top tokens from each stratum (more from harder strata)
+        weight = (num_strata - i) / sum(range(1, num_strata + 1))
+        n_select = max(1, int(total_select * weight))
+        select_indices = stratum_indices[:n_select]
+        mask[select_indices] = 1.0
+    
+    return mask.view(difficulty.shape)
+
+
+# =============================================================================
+# UNIFIED API (auto-selects Triton or PyTorch)
 # =============================================================================
 
 def fused_difficulty_score(
     logits: torch.Tensor,
     targets: torch.Tensor = None,
 ) -> tuple:
-    """
-    Compute difficulty scores with optional loss-based component.
+    """Compute difficulty scores. Uses Triton if available, else PyTorch."""
     
-    Returns:
-        difficulty, confidence, entropy
-    """
+    if HAS_TRITON and logits.is_cuda:
+        try:
+            return _triton_difficulty_score(logits, targets)
+        except Exception:
+            # Fallback on any Triton error
+            pass
+    
+    return _pytorch_difficulty_score(logits, targets)
+
+
+def _triton_difficulty_score(logits: torch.Tensor, targets: torch.Tensor = None):
+    """Triton implementation wrapper."""
     original_shape = logits.shape[:-1]
     vocab_size = logits.shape[-1]
     
@@ -290,10 +186,9 @@ def fused_difficulty_score(
     entropy = torch.empty(num_tokens, device=logits.device, dtype=logits.dtype)
     
     has_targets = targets is not None
-    if has_targets:
-        targets_flat = targets.view(-1).contiguous()
-    else:
-        targets_flat = torch.zeros(num_tokens, device=logits.device, dtype=torch.long)
+    targets_flat = targets.view(-1).contiguous() if has_targets else torch.zeros(
+        num_tokens, device=logits.device, dtype=torch.long
+    )
     
     BLOCK_SIZE = min(1024, triton.next_power_of_2(vocab_size))
     
@@ -316,15 +211,15 @@ def compute_dynamic_threshold(
     base_ratio: float,
     sensitivity: float = 0.5,
 ) -> float:
-    """
-    Compute dynamic token ratio based on batch confidence.
-    Low confidence → more tokens, High confidence → fewer tokens.
-    """
+    """Compute dynamic token ratio based on batch confidence."""
     mean_conf = confidence.mean().item()
-    # Adjust ratio: if mean_conf is low, increase ratio
-    # ratio = base_ratio * (1 + (1 - mean_conf) * sensitivity)
     adjusted_ratio = base_ratio * (1.0 + (1.0 - mean_conf) * sensitivity)
     return min(1.0, max(base_ratio * 0.5, adjusted_ratio))
+
+
+def select_tokens_topk(difficulty: torch.Tensor, ratio: float) -> torch.Tensor:
+    """Top-k hardest tokens selection."""
+    return _pytorch_select_topk(difficulty, ratio)
 
 
 def select_tokens_stratified(
@@ -332,52 +227,8 @@ def select_tokens_stratified(
     total_ratio: float,
     num_strata: int = 4,
 ) -> torch.Tensor:
-    """
-    Stratified token selection across difficulty buckets.
-    """
-    flat_diff = difficulty.view(-1).contiguous()
-    num_tokens = flat_diff.numel()
-    total_select = int(num_tokens * total_ratio)
-    
-    mask = torch.zeros(num_tokens, device=difficulty.device, dtype=difficulty.dtype)
-    
-    BLOCK_SIZE = 1024
-    
-    _stratified_select_kernel[(num_strata,)](
-        flat_diff, mask,
-        num_tokens=num_tokens,
-        num_strata=num_strata,
-        total_select=total_select,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    
-    return mask.view(difficulty.shape)
-
-
-def select_tokens_topk(
-    difficulty: torch.Tensor,
-    ratio: float,
-) -> torch.Tensor:
-    """Top-k hardest tokens selection."""
-    flat_diff = difficulty.view(-1).contiguous()
-    num_tokens = flat_diff.numel()
-    k = max(1, int(num_tokens * ratio))
-    
-    # Find threshold for top-k
-    threshold = torch.topk(flat_diff, k).values[-1].item()
-    
-    mask = torch.zeros(num_tokens, device=difficulty.device, dtype=difficulty.dtype)
-    
-    BLOCK_SIZE = 1024
-    grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    
-    _topk_select_kernel[grid](
-        flat_diff, mask, threshold,
-        num_tokens=num_tokens,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    
-    return mask.view(difficulty.shape)
+    """Stratified token selection across difficulty buckets."""
+    return _pytorch_stratified_select(difficulty, total_ratio, num_strata)
 
 
 def ensure_sequence_coverage(
@@ -388,58 +239,38 @@ def ensure_sequence_coverage(
     min_per_seq: int = 1,
 ) -> torch.Tensor:
     """Ensure minimum token coverage per sequence."""
-    flat_diff = difficulty.view(-1).contiguous()
-    flat_mask = mask.view(-1).contiguous().clone()
+    mask_2d = mask.view(batch_size, seq_len)
+    diff_2d = difficulty.view(batch_size, seq_len)
     
-    BLOCK_SIZE = min(1024, triton.next_power_of_2(seq_len))
+    for b in range(batch_size):
+        selected = mask_2d[b].sum().item()
+        if selected < min_per_seq:
+            need = int(min_per_seq - selected)
+            unselected = (mask_2d[b] == 0)
+            if unselected.any():
+                scores = diff_2d[b].clone()
+                scores[~unselected] = float('-inf')
+                _, top_idx = torch.topk(scores, min(need, unselected.sum().item()))
+                mask_2d[b, top_idx] = 1.0
     
-    _sequence_aware_select_kernel[(batch_size,)](
-        flat_diff, flat_mask,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        min_per_seq=min_per_seq,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    
-    return flat_mask.view(mask.shape)
+    return mask_2d.view(mask.shape)
 
 
 def apply_mask_to_loss(
     per_token_loss: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply selection mask to loss using Triton kernel."""
-    flat_loss = per_token_loss.view(-1).contiguous()
-    flat_mask = mask.view(-1).contiguous()
-    num_tokens = flat_loss.numel()
-    
-    output = torch.empty_like(flat_loss)
-    
-    BLOCK_SIZE = 1024
-    grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-    
-    _apply_mask_to_loss_kernel[grid](
-        flat_loss, flat_mask, output,
-        num_tokens=num_tokens,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-    
-    return output.view(per_token_loss.shape)
+    """Apply selection mask to loss."""
+    return per_token_loss * mask.view(per_token_loss.shape)
 
 
-# Legacy exports for backward compatibility
+# Legacy compatibility
 def triton_fused_difficulty_score(logits):
     return fused_difficulty_score(logits, targets=None)
 
-def triton_bucket_assign(difficulty, num_buckets, num_layers, warmup_progress):
-    # Legacy function - now just returns token selection mask
-    ratio = 1.0 - warmup_progress * 0.75  # 100% -> 25%
-    return select_tokens_topk(difficulty, ratio)
-
 
 class TritonGradientMask(torch.autograd.Function):
-    """Legacy - kept for backward compatibility but deprecated."""
-    
+    """Legacy - kept for backward compatibility."""
     @staticmethod
     def forward(ctx, tensor, stop_layers, layer_idx, leak_rate):
         return tensor
