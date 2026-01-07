@@ -1,40 +1,74 @@
 """
 CGGR - Confidence-Gated Gradient Routing
 =========================================
-Selective loss computation based on token difficulty.
-Only hard tokens contribute to loss, so easy tokens don't generate gradients.
-
-This provides ACTUAL compute savings by excluding easy tokens from backprop entirely.
+Selective loss computation with multiple strategies.
+All operations accelerated with fused Triton kernels.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Literal, Optional, List
 
-from triton_kernels import triton_fused_difficulty_score
+from triton_kernels import (
+    fused_difficulty_score,
+    compute_dynamic_threshold,
+    select_tokens_topk,
+    select_tokens_stratified,
+    ensure_sequence_coverage,
+    apply_mask_to_loss,
+)
 
 
 class CGGRLoss(nn.Module):
     """
-    Wraps a loss function with difficulty-based token selection.
-    Only tokens above the difficulty threshold contribute to loss.
+    Advanced selective loss with multiple strategies.
     
     Args:
-        base_loss: Loss function to wrap (default: CrossEntropyLoss with reduction='none')
-        min_tokens_ratio: Minimum fraction of tokens to include (default: 0.25)
-        warmup_steps: Steps to reach target sparsity (default: 1000)
+        scoring: Difficulty scoring method
+            - 'entropy': Pure entropy-based
+            - 'margin': Margin between top-2 predictions  
+            - 'loss': Use per-token loss directly
+            - 'combined': Entropy + margin + loss (default)
+        
+        selection: Token selection strategy
+            - 'topk': Top-k hardest tokens
+            - 'stratified': Sample from difficulty buckets
+            - 'sequence_aware': Ensure coverage per sequence
+        
+        dynamic_threshold: Adjust ratio based on batch confidence
+        threshold_sensitivity: How much to adjust (0-1)
+        
+        min_tokens_ratio: Target fraction of tokens to keep
+        warmup_steps: Steps to reach target sparsity
+        
+        num_strata: Buckets for stratified sampling
+        min_tokens_per_sequence: Minimum coverage per sequence
     """
     
     def __init__(
-        self, 
-        base_loss: nn.Module = None,
+        self,
+        scoring: Literal['entropy', 'margin', 'loss', 'combined'] = 'combined',
+        selection: Literal['topk', 'stratified', 'sequence_aware'] = 'topk',
+        dynamic_threshold: bool = True,
+        threshold_sensitivity: float = 0.5,
         min_tokens_ratio: float = 0.25,
         warmup_steps: int = 1000,
+        num_strata: int = 4,
+        min_tokens_per_sequence: int = 1,
+        base_loss: nn.Module = None,
     ):
         super().__init__()
-        self.base_loss = base_loss or nn.CrossEntropyLoss(reduction='none')
+        
+        self.scoring = scoring
+        self.selection = selection
+        self.dynamic_threshold = dynamic_threshold
+        self.threshold_sensitivity = threshold_sensitivity
         self.min_tokens_ratio = min_tokens_ratio
         self.warmup_steps = warmup_steps
+        self.num_strata = num_strata
+        self.min_tokens_per_sequence = min_tokens_per_sequence
+        self.base_loss = base_loss or nn.CrossEntropyLoss(reduction='none')
         
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
         self.metrics = {}
@@ -43,26 +77,28 @@ class CGGRLoss(nn.Module):
         """Call after optimizer.step()"""
         self.step_count += 1
     
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Compute loss only for hard tokens.
+        Compute selective loss.
         
         Args:
-            logits: (batch, seq, vocab) or (batch*seq, vocab)
-            targets: (batch, seq) or (batch*seq,)
-        
-        Returns:
-            Scalar loss averaged over selected tokens
+            logits: (batch, seq, vocab) or (N, vocab)
+            targets: (batch, seq) or (N,)
         """
-        # Flatten if needed
+        # Handle shapes
         if logits.dim() == 3:
-            batch, seq, vocab = logits.shape
-            logits_flat = logits.view(-1, vocab)
+            batch_size, seq_len, vocab_size = logits.shape
+            logits_flat = logits.view(-1, vocab_size)
             targets_flat = targets.view(-1)
         else:
+            batch_size, seq_len = 1, logits.shape[0]
+            vocab_size = logits.shape[-1]
             logits_flat = logits
             targets_flat = targets
-            batch, seq = 1, logits.shape[0]
         
         num_tokens = logits_flat.shape[0]
         
@@ -71,35 +107,67 @@ class CGGRLoss(nn.Module):
         
         # Compute difficulty scores (Triton-accelerated)
         with torch.no_grad():
-            difficulty, confidence, entropy = triton_fused_difficulty_score(
-                logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat
-            )
-            difficulty = difficulty.view(-1)
+            # Choose scoring method
+            if self.scoring == 'loss':
+                difficulty = per_token_loss.detach()
+                confidence = torch.zeros_like(difficulty)
+                entropy = difficulty
+            else:
+                use_targets = self.scoring in ['combined', 'loss']
+                difficulty, confidence, entropy = fused_difficulty_score(
+                    logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat,
+                    targets=targets_flat if use_targets else None,
+                )
+                difficulty = difficulty.view(-1)
+                confidence = confidence.view(-1)
+                entropy = entropy.view(-1)
             
-            # Curriculum: gradually reduce token ratio
+            # Compute current ratio with curriculum
             progress = min(1.0, self.step_count.item() / max(1, self.warmup_steps))
-            current_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
+            base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
             
-            # Select top-k hardest tokens
-            k = max(1, int(num_tokens * current_ratio))
-            _, hard_indices = torch.topk(difficulty, k)
+            # Dynamic threshold adjustment
+            if self.dynamic_threshold:
+                current_ratio = compute_dynamic_threshold(
+                    confidence, base_ratio, self.threshold_sensitivity
+                )
+            else:
+                current_ratio = base_ratio
             
-            # Create mask
-            mask = torch.zeros(num_tokens, device=logits.device, dtype=logits.dtype)
-            mask[hard_indices] = 1.0
+            # Token selection based on strategy
+            if self.selection == 'stratified':
+                mask = select_tokens_stratified(
+                    difficulty, current_ratio, self.num_strata
+                )
+            elif self.selection == 'sequence_aware':
+                mask = select_tokens_topk(difficulty, current_ratio)
+                mask = ensure_sequence_coverage(
+                    difficulty, mask, batch_size, seq_len, 
+                    self.min_tokens_per_sequence
+                )
+            else:  # topk
+                mask = select_tokens_topk(difficulty, current_ratio)
+            
+            mask = mask.view(-1)
+            tokens_selected = mask.sum().item()
         
-        # Masked loss (only hard tokens contribute)
-        masked_loss = per_token_loss * mask
-        loss = masked_loss.sum() / mask.sum()
+        # Apply mask to loss (Triton-accelerated)
+        masked_loss = apply_mask_to_loss(per_token_loss, mask)
+        
+        # Average over selected tokens
+        loss = masked_loss.sum() / max(tokens_selected, 1)
         
         # Metrics
         self.metrics = {
             'step': self.step_count.item(),
             'token_ratio': current_ratio,
-            'tokens_used': k,
+            'tokens_selected': int(tokens_selected),
             'tokens_total': num_tokens,
             'avg_confidence': confidence.mean().item(),
-            'avg_masked_loss': loss.item(),
+            'avg_entropy': entropy.mean().item(),
+            'avg_difficulty': difficulty.mean().item(),
+            'selection': self.selection,
+            'scoring': self.scoring,
         }
         
         return loss
@@ -110,30 +178,19 @@ class CGGRLoss(nn.Module):
 
 class CGGRWrapper(nn.Module):
     """
-    Legacy wrapper for backward compatibility.
-    Now just provides telemetry without gradient routing overhead.
+    Legacy wrapper - provides telemetry only.
     Use CGGRLoss for actual compute savings.
     """
     
-    def __init__(
-        self,
-        model: nn.Module,
-        num_buckets: int = 4,
-        warmup_steps: int = 1000,
-        leak_rate: float = 0.0,
-    ):
+    def __init__(self, model, **kwargs):
         super().__init__()
         self.model = model
-        self.num_buckets = num_buckets
-        self.warmup_steps = warmup_steps
-        
         self.register_buffer('current_step_count', torch.tensor(0, dtype=torch.long))
         self.metrics = {}
         
         import warnings
         warnings.warn(
-            "CGGRWrapper adds overhead without compute savings. "
-            "Use CGGRLoss for actual backward speedup.",
+            "CGGRWrapper is deprecated. Use CGGRLoss for compute savings.",
             DeprecationWarning
         )
     
@@ -141,27 +198,7 @@ class CGGRWrapper(nn.Module):
         self.current_step_count += 1
     
     def forward(self, *args, **kwargs):
-        output = self.model(*args, **kwargs)
-        
-        if isinstance(output, torch.Tensor):
-            logits = output
-        elif hasattr(output, 'logits'):
-            logits = output.logits
-        elif isinstance(output, tuple):
-            logits = output[0]
-        else:
-            return output
-        
-        if logits is not None and self.training:
-            with torch.no_grad():
-                difficulty, conf, ent = triton_fused_difficulty_score(logits)
-                self.metrics = {
-                    'step': self.current_step_count.item(),
-                    'avg_confidence': conf.mean().item(),
-                    'avg_entropy': ent.mean().item(),
-                }
-        
-        return output
+        return self.model(*args, **kwargs)
     
-    def get_metrics(self) -> dict:
-        return self.metrics.copy()
+    def get_metrics(self):
+        return self.metrics

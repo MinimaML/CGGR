@@ -7,7 +7,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="cggr",
-    version="0.3.0",
+    version="0.4.0",
     description="Confidence-Gated Gradient Routing for Efficient Transformer Training",
     long_description=long_description,
     long_description_content_type="text/markdown",
