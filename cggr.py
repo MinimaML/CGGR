@@ -259,6 +259,81 @@ def create_truncated_router(model: nn.Module, num_layers: int = 2) -> nn.Module:
     return TruncatedRouter(model, num_layers)
 
 
+
+class CGGRScorer(nn.Module):
+    """
+    Standalone difficulty scorer for native architecture integration.
+    
+    Usage:
+        scorer = CGGRScorer(router, min_tokens_ratio=0.5)
+        scores, mask = scorer(input_ids)
+    """
+    def __init__(
+        self,
+        router: nn.Module,
+        min_tokens_ratio: float = 0.25,
+        warmup_steps: int = 1000,
+        dynamic_threshold: bool = True,
+        threshold_sensitivity: float = 0.5,
+    ):
+        super().__init__()
+        self.router = router
+        self.min_tokens_ratio = min_tokens_ratio
+        self.warmup_steps = warmup_steps
+        self.dynamic_threshold = dynamic_threshold
+        self.threshold_sensitivity = threshold_sensitivity
+        
+        self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
+
+    def step(self):
+        """Call after optimizer.step()"""
+        self.step_count += 1
+
+    def forward(self, input_ids: torch.Tensor, **kwargs):
+        """
+        Returns difficulty scores and boolean mask of hard tokens.
+        
+        Returns:
+            difficulty: (batch*seq,) float scores
+            mask: (batch*seq,) boolean mask (True=Hard/Keep)
+            info: dict with metrics
+        """
+        with torch.no_grad():
+            outputs = self.router(input_ids, **kwargs)
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+            
+            # Compute difficulty
+            difficulty, confidence, entropy = fused_difficulty_score(logits)
+            
+            # Curriculum
+            if self.warmup_steps <= 0:
+                progress = 1.0
+            else:
+                progress = min(1.0, self.step_count.item() / self.warmup_steps)
+            base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
+            
+            # Dynamic threshold
+            if self.dynamic_threshold:
+                current_ratio = compute_dynamic_threshold(
+                    confidence.view(-1), base_ratio, self.threshold_sensitivity
+                )
+            else:
+                current_ratio = base_ratio
+            
+            # Select hard tokens
+            mask = select_tokens_topk(difficulty, current_ratio)
+            
+            info = {
+                'confidence': confidence,
+                'entropy': entropy,
+                'current_ratio': current_ratio
+            }
+            return difficulty, mask, info
+
+
 class CGGRModel(nn.Module):
     """
     Model wrapper with batch splitting for real backward speedup.
@@ -266,12 +341,6 @@ class CGGRModel(nn.Module):
     Uses two-pass forward:
     1. First forward (Router): Lightweight difficulty scoring (fast)
     2. Second forward (Main): Only hard tokens → loss → backward (grad)
-    
-    Args:
-        model: Main model
-        router: Optional lightweight model for Pass 1. If None, uses main model.
-               Use create_truncated_router(model) to create one easily.
-        min_tokens_ratio: Target fraction of tokens to keep (default: 0.25)
     """
     
     def __init__(
@@ -285,89 +354,55 @@ class CGGRModel(nn.Module):
     ):
         super().__init__()
         self.model = model
-        self.router = router if router is not None else model
-        self.min_tokens_ratio = min_tokens_ratio
-        self.warmup_steps = warmup_steps
-        self.dynamic_threshold = dynamic_threshold
-        self.threshold_sensitivity = threshold_sensitivity
+        router_model = router if router is not None else model
         
-        self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
+        # Use common scorer
+        self.scorer = CGGRScorer(
+            router=router_model,
+            min_tokens_ratio=min_tokens_ratio,
+            warmup_steps=warmup_steps,
+            dynamic_threshold=dynamic_threshold,
+            threshold_sensitivity=threshold_sensitivity
+        )
         self.metrics = {}
     
     def step(self):
-        """Call after optimizer.step()"""
-        self.step_count += 1
+        self.scorer.step()
     
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor = None, **kwargs):
-        """
-        Two-pass forward with batch splitting.
-        """
         if labels is None:
-            # Inference mode - just forward main model
             return self.model(input_ids, **kwargs)
         
         batch_size, seq_len = input_ids.shape
         
-        # =====================================================================
-        # PASS 1: Router forward (fast, no gradients)
-        # =====================================================================
-        with torch.no_grad():
-            # Use router for difficulty scores
-            outputs = self.router(input_ids, **kwargs)
-            if hasattr(outputs, 'logits'):
-                logits = outputs.logits
-            else:
-                logits = outputs
-            
-            # Compute difficulty for each token
-            difficulty, confidence, entropy = fused_difficulty_score(logits)
-            
-            # Curriculum: gradually reduce token ratio
-            if self.warmup_steps <= 0:
-                progress = 1.0
-            else:
-                progress = min(1.0, self.step_count.item() / self.warmup_steps)
-            base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
-            
-            # Dynamic threshold adjustment
-            if self.dynamic_threshold:
-                current_ratio = compute_dynamic_threshold(
-                    confidence.view(-1), base_ratio, self.threshold_sensitivity
-                )
-            else:
-                current_ratio = base_ratio
-            
-            # Select hard tokens
-            mask = select_tokens_topk(difficulty, current_ratio)
-            
-            # Get hard token indices
-            hard_mask = mask.view(batch_size, seq_len) > 0.5
-            
-            # Count tokens
-            tokens_total = batch_size * seq_len
-            tokens_selected = hard_mask.sum().item()
+        # PASS 1: Get scores from scorer
+        difficulty, mask, info = self.scorer(input_ids, **kwargs)
         
-        # =====================================================================
-        # PASS 2: Main model forward (only hard tokens, with gradients)
-        # =====================================================================
+        current_ratio = info['current_ratio']
+        confidence = info['confidence']
+        entropy = info['entropy']
+        
+        # Get hard token indices
+        hard_mask = mask.view(batch_size, seq_len) > 0.5
+        tokens_total = batch_size * seq_len
+        tokens_selected = hard_mask.sum().item()
+        
+        # PASS 2: Main model forward
         if tokens_selected > 0:
-            # Alternative: Split by sequence difficulty
-            seq_difficulty = difficulty.mean(dim=-1)  # (batch,)
+            # Batch Splitting Logic (same as before)
+            seq_difficulty = difficulty.view(batch_size, seq_len).mean(dim=-1)
             k = max(1, int(batch_size * current_ratio))
             _, hard_seq_indices = torch.topk(seq_difficulty, k)
             
-            # Forward only hard sequences
             hard_input_ids = input_ids[hard_seq_indices]
             hard_labels = labels[hard_seq_indices]
             
-            # Forward with gradients through MAIN model
             hard_outputs = self.model(hard_input_ids, **kwargs)
             if hasattr(hard_outputs, 'logits'):
                 hard_logits = hard_outputs.logits
             else:
                 hard_logits = hard_outputs
             
-            # Compute loss
             hard_logits_flat = hard_logits[:, :-1, :].contiguous().view(-1, hard_logits.shape[-1])
             hard_labels_flat = hard_labels[:, 1:].contiguous().view(-1)
             
@@ -375,7 +410,7 @@ class CGGRModel(nn.Module):
             
             tokens_selected = hard_seq_indices.numel() * (seq_len - 1)
         else:
-            # Fallback: full forward through main model
+            # Fallback
             outputs = self.model(input_ids, **kwargs)
             if hasattr(outputs, 'logits'):
                 logits = outputs.logits
@@ -387,17 +422,13 @@ class CGGRModel(nn.Module):
             loss = F.cross_entropy(logits_flat, labels_flat)
             tokens_selected = tokens_total
         
-        # Metrics
         self.metrics = {
-            'step': self.step_count.item(),
+            'step': self.scorer.step_count.item(),
             'token_ratio': current_ratio,
             'tokens_selected': int(tokens_selected),
             'tokens_total': tokens_total,
-            'sequences_selected': hard_seq_indices.numel() if tokens_selected > 0 else batch_size,
-            'sequences_total': batch_size,
             'avg_confidence': confidence.mean().item(),
             'avg_entropy': entropy.mean().item(),
-            'router_used': self.router is not self.model,
         }
         
         return loss

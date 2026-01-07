@@ -108,6 +108,33 @@ loss.backward()
 
 ---
 
+## Native Integration (e.g. SRDE)
+
+For advanced architectures like MoE or SRDE where batch splitting (resizing tensors) causes issues, use `CGGRScorer` to generate a routing mask.
+
+```python
+from cggr import CGGRScorer
+
+class MyModel(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        # Initialize scorer
+        self.scorer = CGGRScorer(router=model, min_tokens_ratio=0.25)
+    
+    def forward(self, input_ids):
+        # returns boolean mask (True = Hard/Keep, False = Easy/Drop)
+        difficulty, mask, info = self.scorer(input_ids)
+        
+        # Apply Null Routing (Gradient Sparsity)
+        # Multiply expert logits by mask to zero-out gradients for easy tokens
+        expert_out = self.experts(input_ids) * mask.unsqueeze(-1)
+        
+        return expert_out
+```
+
+---
+
 ## CGGRLoss API (Manual Integration)
 
 If you cannot use `CGGRModel` (e.g. specialized architectures), you can use `CGGRLoss`.

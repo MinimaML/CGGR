@@ -70,6 +70,23 @@ loss.backward()
 ### 2. Manual Integration (CGGRLoss)
 
 
+### 3. Native Integration (e.g. MoE/SRDE)
+
+For architectures like SRDE that require static tensor shapes, you can use `CGGRScorer` to generate a routing mask instead of splitting the batch.
+
+```python
+from cggr import CGGRScorer
+
+# 1. Initialize Scorer
+self.scorer = CGGRScorer(router, min_tokens_ratio=0.5)
+
+# 2. Get Mask
+difficulty, mask, info = self.scorer(input_ids)
+
+# 3. Apply Mask (Null Routing)
+# mask is Boolean: True=Hard (Route to Expert), False=Easy (Skip/Null)
+expert_output = expert_layer(x) * mask.unsqueeze(-1)
+```
 ```python
 from cggr import CGGRLoss
 

@@ -412,7 +412,7 @@ def main():
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
-    cggr_model.step_count.fill_(1000)  # Skip warmup
+    cggr_model.scorer.step_count.fill_(1000)  # Skip warmup
     
     # Benchmark CGGRModel
     forward_times = []
@@ -475,7 +475,7 @@ def main():
     torch.cuda.synchronize()
     gc.collect()
     torch.cuda.empty_cache()
-    truncated_model.step_count.fill_(1000)
+    truncated_model.scorer.step_count.fill_(1000)
     
     # Benchmark
     forward_times = []
