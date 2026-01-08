@@ -137,6 +137,9 @@ class MyModel(nn.Module):
 
 ## CGGRLoss API (Manual Integration)
 
+> [!WARNING]
+> This is highly experimental, and prepare for the worst hope for the best.
+
 If you cannot use `CGGRModel` (e.g. specialized architectures), you can use `CGGRLoss`.
 *Note: This effectively sparsifies gradients but does NOT save backward pass FLOPs unless combined with custom slicing.*
 

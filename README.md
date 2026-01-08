@@ -69,6 +69,28 @@ loss.backward()
 
 ### 2. Manual Integration (CGGRLoss)
 
+> [!WARNING]
+> This is highly experimental, and prepare for the worst hope for the best.
+
+If you cannot use `CGGRModel` (e.g. specialized architectures), you can use `CGGRLoss` manually.
+
+```python
+from cggr import CGGRLoss
+
+criterion = CGGRLoss(
+    scoring='combined',      # 'entropy', 'margin', 'loss', 'combined'
+    selection='stratified',  # 'topk', 'stratified', 'sequence_aware'
+    min_tokens_ratio=0.25,
+    warmup_steps=1000,
+)
+
+for batch in dataloader:
+    logits = model(input_ids)
+    loss = criterion(logits, targets)  # Only hard tokens
+    loss.backward()
+    optimizer.step()
+    criterion.step()
+```
 
 ### 3. Native Integration (e.g. MoE/SRDE)
 
@@ -87,23 +109,7 @@ difficulty, mask, info = self.scorer(input_ids)
 # mask is Boolean: True=Hard (Route to Expert), False=Easy (Skip/Null)
 expert_output = expert_layer(x) * mask.unsqueeze(-1)
 ```
-```python
-from cggr import CGGRLoss
 
-criterion = CGGRLoss(
-    scoring='combined',      # 'entropy', 'margin', 'loss', 'combined'
-    selection='stratified',  # 'topk', 'stratified', 'sequence_aware'
-    min_tokens_ratio=0.25,
-    warmup_steps=1000,
-)
-
-for batch in dataloader:
-    logits = model(input_ids)
-    loss = criterion(logits, targets)  # Only hard tokens
-    loss.backward()
-    optimizer.step()
-    criterion.step()
-```
 
 ## Scoring Strategies
 
