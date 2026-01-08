@@ -108,6 +108,7 @@ class CGGRLoss(nn.Module):
             difficulty, confidence, entropy = fused_difficulty_score(
                 logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat,
                 targets=None,  # Don't use targets for selection to avoid computing loss
+                mode=self.scoring,
             )
             difficulty = difficulty.view(-1)
             confidence = confidence.view(-1)
@@ -306,7 +307,10 @@ class CGGRScorer(nn.Module):
                 logits = outputs
             
             # Compute difficulty
-            difficulty, confidence, entropy = fused_difficulty_score(logits)
+            difficulty, confidence, entropy = fused_difficulty_score(
+                logits,
+                mode=self.scoring if hasattr(self, 'scoring') else 'combined'
+            )
             
             # Curriculum
             if self.warmup_steps <= 0:
