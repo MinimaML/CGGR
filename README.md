@@ -1,5 +1,8 @@
 # CGGR - Confidence-Gated Gradient Routing
 
+> [!WARNING]
+> This is highly experimental, and prepare for the worst hope for the best.
+
 Selective loss computation for Transformer training. Only hard tokens contribute to loss, providing actual backward pass savings.
 
 ## Installation
@@ -68,9 +71,6 @@ loss.backward()
 ```
 
 ### 2. Manual Integration (CGGRLoss)
-
-> [!WARNING]
-> This is highly experimental, and prepare for the worst hope for the best.
 
 If you cannot use `CGGRModel` (e.g. specialized architectures), you can use `CGGRLoss` manually.
 
