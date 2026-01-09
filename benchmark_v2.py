@@ -400,30 +400,34 @@ class Benchmarker:
         bs = self.config.batch_sizes[0]
         input_ids, labels = self.generate_data(bs)
         
-        # 1. Checkpointing VRAM savings
+        # 1. Checkpointing VRAM savings (compare SAME model with/without checkpointing)
         try:
             from cggr_checkpointing import CGGRCheckpointedModel
             
-            # Without checkpointing
+            # Standard model WITHOUT checkpointing
             reset_gpu()
-            model_no_ckpt = self._fresh_cggr_model()
+            base1 = self._fresh_model()
             with torch.amp.autocast('cuda'):
-                loss = model_no_ckpt(input_ids, labels=labels)
+                outputs = base1(input_ids, labels=labels)
+                loss = outputs.loss
             loss.backward()
             vram_no_ckpt = torch.cuda.max_memory_allocated() / 1024**2
-            del model_no_ckpt
+            del base1
             
-            # With checkpointing
+            # Standard model WITH gradient checkpointing enabled
             reset_gpu()
-            base = self._fresh_model()
-            model_ckpt = CGGRCheckpointedModel(base, use_checkpointing=True)
+            base2 = self._fresh_model()
+            if hasattr(base2, 'gradient_checkpointing_enable'):
+                base2.gradient_checkpointing_enable()
             with torch.amp.autocast('cuda'):
-                loss = model_ckpt(input_ids, labels=labels)
+                outputs = base2(input_ids, labels=labels)
+                loss = outputs.loss
             loss.backward()
             vram_ckpt = torch.cuda.max_memory_allocated() / 1024**2
-            del model_ckpt
+            del base2
             
             ckpt_savings = (vram_no_ckpt - vram_ckpt) / vram_no_ckpt * 100
+            console.print(f"[dim]Checkpointing: {vram_no_ckpt:.0f}MB -> {vram_ckpt:.0f}MB ({ckpt_savings:.1f}% savings)[/dim]")
         except Exception as e:
             console.print(f"[yellow]Checkpointing test skipped: {e}[/yellow]")
             ckpt_savings = 0.0
