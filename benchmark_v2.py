@@ -211,7 +211,7 @@ class Benchmarker:
         # Warmup
         for _ in range(self.config.num_warmup):
             model.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 out = model(input_ids, labels=labels)
                 loss = out if isinstance(out, torch.Tensor) else out.loss
             loss.backward()
@@ -227,7 +227,7 @@ class Benchmarker:
             model.zero_grad()
             iter_start = time.perf_counter()
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 out = model(input_ids, labels=labels)
                 loss = out if isinstance(out, torch.Tensor) else out.loss
             loss.backward()
@@ -282,7 +282,7 @@ class Benchmarker:
         reset_gpu()
         model.train()
         
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             out = model(input_ids, labels=labels)
             loss = out if isinstance(out, torch.Tensor) else out.loss
         loss.backward()
@@ -308,7 +308,7 @@ class Benchmarker:
                 reset_gpu()
                 input_ids, labels = self.generate_data(mid)
                 
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     out = model(input_ids, labels=labels)
                     loss = out if isinstance(out, torch.Tensor) else out.loss
                 loss.backward()
@@ -368,7 +368,7 @@ class Benchmarker:
                 input_ids, labels = self.generate_data(bs)
                 
                 optimizer.zero_grad()
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     out = model(input_ids, labels=labels)
                     loss = out if isinstance(out, torch.Tensor) else out.loss
                 
@@ -407,7 +407,7 @@ class Benchmarker:
             # Without checkpointing
             reset_gpu()
             model_no_ckpt = self._fresh_cggr_model()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 loss = model_no_ckpt(input_ids, labels=labels)
             loss.backward()
             vram_no_ckpt = torch.cuda.max_memory_allocated() / 1024**2
@@ -417,7 +417,7 @@ class Benchmarker:
             reset_gpu()
             base = self._fresh_model()
             model_ckpt = CGGRCheckpointedModel(base, use_checkpointing=True)
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 loss = model_ckpt(input_ids, labels=labels)
             loss.backward()
             vram_ckpt = torch.cuda.max_memory_allocated() / 1024**2

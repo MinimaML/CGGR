@@ -67,7 +67,7 @@ def benchmark_standard_loss(model, input_ids, labels, num_warmup=5, num_runs=20)
     
     # Warmup
     for _ in range(num_warmup):
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(input_ids)
             logits = outputs.logits[:, :-1, :].contiguous()
             targets = labels[:, 1:].contiguous()
@@ -90,7 +90,7 @@ def benchmark_standard_loss(model, input_ids, labels, num_warmup=5, num_runs=20)
         
         # Forward
         t0 = time.perf_counter()
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(input_ids)
             logits = outputs.logits[:, :-1, :].contiguous()
             targets = labels[:, 1:].contiguous()
@@ -98,7 +98,7 @@ def benchmark_standard_loss(model, input_ids, labels, num_warmup=5, num_runs=20)
         t1 = time.perf_counter()
         
         # Loss
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
         torch.cuda.synchronize()
         t2 = time.perf_counter()
@@ -148,7 +148,7 @@ def benchmark_cggr_loss(
     
     # Warmup
     for _ in range(num_warmup):
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(input_ids)
             logits = outputs.logits[:, :-1, :].contiguous()
             targets = labels[:, 1:].contiguous()
@@ -177,7 +177,7 @@ def benchmark_cggr_loss(
         
         # Forward
         t0 = time.perf_counter()
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(input_ids)
             logits = outputs.logits[:, :-1, :].contiguous()
             targets = labels[:, 1:].contiguous()
@@ -185,7 +185,7 @@ def benchmark_cggr_loss(
         t1 = time.perf_counter()
         
         # Loss (includes CGGR overhead)
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             loss = criterion(logits, targets)
         torch.cuda.synchronize()
         t2 = time.perf_counter()

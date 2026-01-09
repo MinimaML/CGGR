@@ -183,7 +183,7 @@ def benchmark_run(model, input_ids, labels, num_runs=50, mode='train'):
     
     # Warmup
     for _ in range(5):
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(input_ids, labels=labels)
             loss = outputs if isinstance(outputs, torch.Tensor) else outputs.loss
         if mode == 'train':
@@ -200,13 +200,13 @@ def benchmark_run(model, input_ids, labels, num_runs=50, mode='train'):
         iter_start = time.perf_counter()
         if mode == 'train':
             model.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(input_ids, labels=labels)
                 loss = outputs if isinstance(outputs, torch.Tensor) else outputs.loss
             loss.backward()
         else:
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     model(input_ids)
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - iter_start) * 1000)
@@ -290,7 +290,7 @@ def benchmark_hard_token_loss(model_std, model_cggr, preloaded_data, num_batches
             batch = preloaded_data[i]
             ids, labels = batch[0].cuda(), batch[1].cuda()
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 # 1. Get CGGR selective loss and the mask it used
                 difficulty, mask, info = model_cggr.scorer(ids)
                 

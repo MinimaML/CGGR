@@ -308,7 +308,7 @@ def run_training(
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 if mode == "cggr":
                     loss = model(input_ids, labels=labels)
                 else:

@@ -105,7 +105,7 @@ def main():
                     
                     # We use the raw base model for PPL to avoid selective loss effects
                     # This ensures the PPL is comparable to a standard baseline
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         outputs = model.model(ids, labels=ids)
                         loss = outputs.loss
                     
@@ -148,7 +148,7 @@ def main():
             
             optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(input_ids, labels=labels)
                 loss = outputs if isinstance(outputs, torch.Tensor) else outputs.loss
             
