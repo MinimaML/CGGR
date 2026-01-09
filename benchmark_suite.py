@@ -47,10 +47,10 @@ def reset_gpu():
     gc.collect()
 
 def get_safe_batch_sizes():
-    """Returns safe, pre-defined batch sizes for 12GB VRAM."""
+    # Conservative limits for 12GB VRAM
     return {
-        "standard": 4,  # ~4.5GB VRAM, very safe
-        "cggr": 8       # ~3GB VRAM due to selective gradients
+        "standard": 4,  # ~5.5GB VRAM (Safe baseline)
+        "cggr": 16      # ~8.5GB VRAM (Higher capacity due to sparsity)
     }
 
 def load_eval_data(tokenizer, num_samples=50, seq_len=512):
@@ -177,6 +177,10 @@ def benchmark_convergence(model, preloaded_data, num_steps=50, name="Model"):
                 loss = outputs if isinstance(outputs, torch.Tensor) else outputs.loss
             
             loss.backward()
+            
+            # Clip gradients for stability (especially with sparse/hard-token training)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
             optimizer.step()
             
             if hasattr(model, 'step'):
@@ -270,7 +274,7 @@ def main():
         iterator = iter(dataset)
         for _ in range(50):
             try:
-                texts = [next(iterator)['text'][:2048] for _ in range(4)]  # bs=4
+                texts = [next(iterator)['text'][:2048] for _ in range(16)]  # bs=16 (max needed)
                 enc = tokenizer(texts, truncation=True, max_length=512, padding='max_length', return_tensors='pt')
                 preloaded_batches.append((enc['input_ids'], enc['input_ids']))
             except StopIteration:
@@ -281,7 +285,7 @@ def main():
         preloaded_batches = []
         vocab_size = tokenizer.vocab_size
         for _ in range(50):
-            ids = torch.randint(1, vocab_size - 1, (4, 512))
+            ids = torch.randint(1, vocab_size - 1, (16, 512))
             preloaded_batches.append((ids, ids))
         
     input_ids, labels = preloaded_batches[0][0].cuda(), preloaded_batches[0][1].cuda()
@@ -358,16 +362,20 @@ def main():
     # 5. CONVERGENCE COMPARISON (LOSS CURVES)
     console.print("\n[bold magenta]3. CONVERGENCE & QUALITY (LOSS CURVES)[/bold magenta]")
     
+    # Prepare sliced batches
+    std_batches = [(b[0][:max_bs_std], b[1][:max_bs_std]) for b in preloaded_batches]
+    cggr_batches = [(b[0][:max_bs_cggr], b[1][:max_bs_cggr]) for b in preloaded_batches]
+    
     # Train Standard Model
     model = get_model()
-    std_conv = benchmark_convergence(model, preloaded_batches, name="Standard")
+    std_conv = benchmark_convergence(model, std_batches, name="Standard")
     results.append(std_conv)
     del model
     reset_gpu()
 
     # Train CGGR Model
     model = get_cggr_fn()
-    cggr_conv = benchmark_convergence(model, preloaded_batches, name="CGGR (25%)")
+    cggr_conv = benchmark_convergence(model, cggr_batches, name="CGGR (25%)")
     results.append(cggr_conv)
     del model
     reset_gpu()
