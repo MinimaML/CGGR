@@ -257,7 +257,7 @@ def run_training(
         tokenizer.pad_token = tokenizer.eos_token
     
     base_model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16
+        model_name, torch_dtype=torch.float32  # Use float32, let autocast handle precision
     ).to(device)
     
     if hasattr(base_model, 'gradient_checkpointing_enable'):
@@ -281,7 +281,7 @@ def run_training(
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     total_steps_estimate = int((hours * 3600) / 0.5)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=500, num_training_steps=total_steps_estimate)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')  # Fixed deprecation warning
     
     # Training loop
     start_time = time.time()
