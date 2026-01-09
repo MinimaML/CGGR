@@ -49,7 +49,7 @@ class CGGRLoss(nn.Module):
     def __init__(
         self,
         scoring: Literal['entropy', 'margin', 'loss', 'combined'] = 'combined',
-        selection: Literal['topk', 'stratified', 'sequence_aware'] = 'topk',
+        selection: Literal['topk', 'stratified', 'sequence_aware', 'fixed_quota'] = 'topk',
         dynamic_threshold: bool = True,
         threshold_sensitivity: float = 0.5,
         min_tokens_ratio: float = 0.25,
@@ -122,7 +122,10 @@ class CGGRLoss(nn.Module):
             base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
             
             # Dynamic threshold adjustment
-            if self.dynamic_threshold:
+            if self.selection == 'fixed_quota':
+                # FIXED QUOTA: Force fixed ratio, ignore dynamic_threshold
+                current_ratio = base_ratio
+            elif self.dynamic_threshold:
                 current_ratio = compute_dynamic_threshold(
                     confidence, base_ratio, self.threshold_sensitivity
                 )
@@ -140,7 +143,7 @@ class CGGRLoss(nn.Module):
                     difficulty, mask, batch_size, seq_len, 
                     self.min_tokens_per_sequence
                 )
-            else:  # topk
+            else:  # topk OR fixed_quota
                 mask = select_tokens_topk(difficulty, current_ratio)
             
             mask = mask.view(-1)
@@ -276,6 +279,7 @@ class CGGRScorer(nn.Module):
         warmup_steps: int = 1000,
         dynamic_threshold: bool = True,
         threshold_sensitivity: float = 0.5,
+        selection: Literal['topk', 'stratified', 'sequence_aware', 'fixed_quota'] = 'topk',
     ):
         super().__init__()
         self.router = router
@@ -283,6 +287,7 @@ class CGGRScorer(nn.Module):
         self.warmup_steps = warmup_steps
         self.dynamic_threshold = dynamic_threshold
         self.threshold_sensitivity = threshold_sensitivity
+        self.selection = selection
         
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
 
@@ -320,7 +325,9 @@ class CGGRScorer(nn.Module):
             base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
             
             # Dynamic threshold
-            if self.dynamic_threshold:
+            if hasattr(self, 'selection') and self.selection == 'fixed_quota':
+                 current_ratio = base_ratio
+            elif self.dynamic_threshold:
                 current_ratio = compute_dynamic_threshold(
                     confidence.view(-1), base_ratio, self.threshold_sensitivity
                 )
@@ -355,6 +362,7 @@ class CGGRModel(nn.Module):
         warmup_steps: int = 1000,
         dynamic_threshold: bool = True,
         threshold_sensitivity: float = 0.5,
+        selection: Literal['topk', 'stratified', 'sequence_aware', 'fixed_quota'] = 'topk',
     ):
         super().__init__()
         self.model = model
@@ -366,7 +374,8 @@ class CGGRModel(nn.Module):
             min_tokens_ratio=min_tokens_ratio,
             warmup_steps=warmup_steps,
             dynamic_threshold=dynamic_threshold,
-            threshold_sensitivity=threshold_sensitivity
+            threshold_sensitivity=threshold_sensitivity,
+            selection=selection
         )
         self.metrics = {}
     
@@ -445,7 +454,14 @@ class CGGRModel(nn.Module):
 __all__ = [
     'CGGRLoss', 
     'CGGRModel', 
+    'CGGRScorer',
     'create_truncated_router', 
-    'TruncatedRouter'
+    'TruncatedRouter',
 ]
+
+# Tier 1 Optimizations (import separately)
+# from cggr_checkpointing import CGGRCheckpointedModel, SelectiveCheckpointWrapper
+# from cggr_async import AsyncCGGRScorer, AsyncCGGRModel
+# from cggr_dataloader import NanoRouter, DifficultyFilteredDataLoader
+
 
