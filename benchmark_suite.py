@@ -441,6 +441,13 @@ def main():
         else:
             print(f"\n⚠ QUALITY CHECK: CGGR loss differs by {loss_diff:.1f}% from Standard")
 
+    # Save to JSON
+    import json
+    from dataclasses import asdict
+    with open("benchmark_results.json", "w") as f:
+        json.dump([asdict(r) for r in results], f, indent=2)
+    print("[Results saved to benchmark_results.json]")
+
 
 if __name__ == "__main__":
     main()
