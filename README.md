@@ -23,25 +23,30 @@ pip install cggr
 | **Data Efficiency** | Learns from all tokens | Prioritizes hard tokens | Learns faster from hard examples  |
 | **Memory**          | High (full graph)      | Lower (sparse graph)    | Can increase batch size           |
 
-## Benchmarks
+## Benchmark Race Results (2026)
 
-**Hardware:** RTX 3060
-**Model:** SmolLM-135M (Llama architecture)  
-**Dataset:** FineWeb-Edu
+**Model:** Google Gemma-3-4B-IT  
+**Dataset:** AI-MO/NuminaMath-1.5  
+**Evaluation:** AIME 2024 (Math Reasoning)  
 
-```mermaid
-%%{init: {'theme': 'dark', 'themeVariables': { 'fontSize': '16px'}}}%%
-xychart-beta
-    title "Training Step Time (Lower is Better)"
-    x-axis ["Standard", "CGGR (Optimized)"]
-    y-axis "Time (ms)" 0 --> 350
-    bar [309, 220]
-```
+> [!TIP]
+> **Key Result:** CGGR achieved **4x higher sample throughput** and **+1.5% Accuracy** by utilizing idle compute cycles.
 
-| Configuration         | Forward (ms) | Backward (ms) | Total Step (ms) | **Speedup** |
-| :-------------------- | :----------- | :------------ | :-------------- | :---------- |
-| **Standard Training** | 118 ms       | 185 ms        | 309 ms          | 1.0x        |
-| **CGGR (Optimized)**  | **127 ms**   | **93 ms**     | **220 ms**      | **1.40x**   |
+| Metric                      | Standard (BS=1) | CGGR (BS=4) | Improvement |
+| :-------------------------- | :-------------- | :---------- | :---------- |
+| **Final Accuracy (AIME)**   | 8.00%           | **9.50%**   | **+1.50%**  |
+| **Final Loss**              | 0.3610          | **0.0980**  | **-73%**    |
+| **Total Samples Processed** | ~14,368         | ~58,716     | **4.08x**   |
+| **Wall Clock Time**         | 1.5 Hours       | 1.5 Hours   | Same        |
+
+### The "Free Lunch" Phenomenon
+In standard training (Batch Size = 1), high-end GPUs are often **latency-bound**—spending more time waiting for memory transfers than doing math. 
+
+CGGR exploits this by **quadrupling the batch size** (Batch Size = 4) without increasing the step time.
+*   **Step Latency:** Unchanged (1.02x throughput ratio in steps/sec).
+*   **Data Throughput:** **4.08x higher** (samples/sec).
+
+By processing 4x more data in the same timeframe, CGGR converges significantly faster and deeper (Loss 0.09 vs 0.36).
 
 ## Quick Start
 

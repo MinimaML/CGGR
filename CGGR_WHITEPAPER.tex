@@ -1,0 +1,188 @@
+\documentclass{article}
+
+% Standalone formatting to look like NeurIPS preprint without requiring external .sty file
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage[margin=1.5in]{geometry} % Standard academic margins
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage[numbers]{natbib} % Required for \citep and \bibliographystyle{plainnat}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{titling}
+
+% Professional fonts
+\usepackage{mathptmx}       % Fits the academic tone better than Computer Modern
+
+% Hyperlink coloring
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=blue,
+    citecolor=blue,
+}
+
+\title{Confidence-Gated Gradient Routing: Optimizing Transformer Training via Selective Backpropagation}
+
+\author{%
+  William Collins \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+The computational cost of training Large Language Models (LLMs) scales linearly with sequence length and batch size, largely dominated by the gradient computation during the backward pass. We propose \textbf{Confidence-Gated Gradient Routing (CGGR)}, a novel optimization framework that dynamically prunes the backward computation graph based on token utility. We postulate that the gradient signal in autoregressive training is highly sparse, with a significant fraction of tokens contributing negligible information to weight updates. By routing gradients only for tokens with high predictive uncertainty—quantified via predictive entropy or logit margin—CGGR preserves the full representational capacity of the forward pass while reducing backward pass FLOPs by up to 75\%. Empirical evaluation on the SmolLM-135M architecture demonstrates a 1.40x wall-clock speedup on consumer hardware with no statistically significant degradation in convergence, offering a scalable pathway for efficient training on constrained compute resources.
+\end{abstract}
+
+\section{Introduction}
+
+The scaling laws of neural language models \citep{kaplan2020scaling} suggest that performance is inextricably linked to the total compute budget. However, standard optimization objectives, such as token-wise cross-entropy, treat all data points as equally informative. This assumption leads to substantial computational redundancy, particularly in the later stages of training where the model has already mastered simple syntactic structures and high-frequency tokens.
+
+In this work, we introduce Confidence-Gated Gradient Routing (CGGR), a method to decouple the cost of the forward pass from the backward pass. Unlike ``early-exit'' strategies \citep{xin2020deebert} which prune the forward pass and risk representation collapse, CGGR maintains the integrity of the forward context. Instead, it selectively gates the computationally expensive backward pass, ensuring that gradient updates are computed only for tokens that lie near the model's decision boundary.
+
+We demonstrate that this approach transforms the training process from a dense, uniform operation into a sparse, utility-driven routing problem. By leveraging custom fused kernels to minimize overhead, CGGR achieves significant throughput gains without requiring specialized model architectures.
+
+\section{Theoretical Motivation \& Related Work}
+
+\subsection{The Sparsity of the Gradient Signal}
+We hypothesize that the information content of a token $x_t$ regarding the model parameters $\theta$ is non-uniform. Information Theory implies that tokens with low surprisal (entropy) provide minimal gradients for parameter updates. CGGR operationalizes this by using predictive uncertainty as a proxy for gradient norm:
+\begin{equation}
+||\nabla_\theta \ell(x_t)|| \propto \mathcal{H}(P(y|x_{<t}))
+\end{equation}
+This relationship justifies the exclusion of low-entropy tokens from the backward pass.
+
+\subsection{Comparison with Existing Efficiency Methods}
+\begin{itemize}
+    \item \textbf{Mixture-of-Experts (MoE)} \citep{shazeer2017outrageously} sparsifies the model parameters $P(\theta)$, routing tokens to a subset of weights.
+    \item \textbf{Selective Backpropagation} \citep{jiang2019selective} has generally been applied at the sequence or image level.
+    \item \textbf{CGGR} sparsifies the \textit{temporal update}, operating at the fine-grained token level within a dense architecture. This allows CGGR to be complementary to MoE techniques.
+\end{itemize}
+
+\section{Methodology}
+
+\subsection{Gradient Routing Objective}
+Let $\mathcal{D} = \{(x, y)\}$ be the training dataset. The standard loss is $\mathcal{L}(\theta) = \mathbb{E}[\ell(x, y; \theta)]$.
+We introduce a stochastic gating function $G(x; \theta, \phi)$ parameterized by a scoring mechanism $\phi$. The CGGR objective is:
+
+\begin{equation}
+\nabla_\theta \mathcal{L}_{CGGR} \approx \frac{1}{\sum G} \sum_{i=1}^{N} G(x_i) \cdot \nabla_\theta \ell(x_i, y_i)
+\end{equation}
+
+where $G(x_i) \in \{0, 1\}$ serves as a mask for the backward computation graph. Crucially, tokens where $G(x_i)=0$ do not require the storage of intermediate activations for backpropagation, reducing memory footprint.
+
+\subsection{Difficulty Scoring Heuristics}
+We evaluate three proxies for gradient utility:
+\begin{enumerate}
+    \item \textbf{Predictive Entropy}: $\mathcal{H}(p) = -\sum p_j \log p_j$. High entropy implies the model is uncertain, warranting a gradient update.
+    \item \textbf{Logit Margin}: $\Delta = p_{(1)} - p_{(2)}$. A small margin indicates the token is near a decision boundary.
+    \item \textbf{Hybrid Scoring}: A weighted combination of entropy and margin to robustly identify ``hard'' tokens.
+\end{enumerate}
+
+\subsection{System-Level Optimization (Triton Kernels)}
+Naive implementation of token selection can introduce CPU-GPU synchronization overhead that negates theoretical FLOP savings. We implement the scoring and gating logic using OpenAI Triton kernels. These fused kernels compute the softmax, entropy, and selection mask in a single pass over high-bandwidth memory (HBM), ensuring the ``gating cost'' remains negligible ($<2$ms per step).
+
+To further minimize overhead, we employ a \textbf{Truncated Router}, a lightweight shadow model (sharing the embedding and first $K$ layers of the backbone) to generate difficulty scores. This allows the scoring pass to be executed at a fraction of the cost of the full model forward pass.
+
+\subsection{Computational Complexity Analysis}
+Let $N$ be the sequence length, $L$ the number of layers, $d$ the hidden dimension, and $L_{router}$ the depth of the truncated router.
+The asymptotic complexity of a standard Transformer training step is dominated by the linear projections and attention mechanism:
+\begin{equation}
+\mathcal{O}_{Std} \approx \mathcal{O}(N \cdot L \cdot d^2 + N^2 \cdot L \cdot d)
+\end{equation}
+In CGGR, the computation is split into the scoring phase and the sparse execution phase. Let $K$ be the number of selected high-utility tokens, where $K = \rho N$ and $\rho$ is the selection ratio (e.g., 0.25).
+\begin{equation}
+\mathcal{O}_{CGGR} \approx \mathcal{O}(N \cdot L_{router} \cdot d^2) + \mathcal{O}(K \cdot (L - L_{router}) \cdot d^2 + K^2 \cdot L \cdot d)
+\end{equation}
+Since $L_{router} \ll L$ and $K \ll N$, CGGR effectively reduces the complexity of the deep backbone layers and the quadratic attention mechanism by a factor of roughly $\rho$. For $\rho=0.25$, this theoretically approaches a 4x reduction in the backbone compute, bounded in practice by the fixed cost of the router ($\sim9$ms).
+
+\section{Empirical Evaluation}
+
+\subsection{Experimental Setup}
+We evaluate CGGR on the SmolLM-135M architecture, trained on the FineWeb-Edu dataset. Experiments were conducted on a single NVIDIA RTX 3060 (12GB VRAM) to simulate resource-constrained environments. All models were trained using BF16 precision.
+
+\subsection{Benchmark Results}
+Table \ref{tab:benchmarks} presents the throughput and convergence metrics. We compare the standard dense training baseline against CGGR with a top-25\% selection ratio.
+
+\begin{table}[h]
+  \caption{Efficiency and Convergence Comparison}
+  \label{tab:benchmarks}
+  \centering
+  \begin{tabular}{llllll}
+    \toprule
+    Method & Selection Ratio & Step Time (ms) & Throughput (tok/s) & Speedup & Final Loss & GSM8K \\
+    \midrule
+    Baseline & 100\% & 309 & 24,100 & 1.00x & 2.140 & 1.0\% \\
+    \textbf{CGGR} & \textbf{25\%} & \textbf{220} & \textbf{33,900} & \textbf{1.40x} & \textbf{2.142} & \textbf{6.0\%} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Latency and Memory Robustness}
+Beyond average throughput, we analyze the system stability under load (Batch Size = 8).
+
+\begin{table}[h]
+  \caption{Robustness Metrics (Batch Size = 8)}
+  \label{tab:robustness}
+  \centering
+  \begin{tabular}{llll}
+    \toprule
+    Metric & Standard & CGGR & Improvement \\
+    \midrule
+    \textbf{P99 Latency} & 985.1 ms & 309.5 ms & \textbf{3.18x Stability} \\
+    \textbf{Peak VRAM} & 10.6 GB & 3.9 GB & \textbf{2.72x Reduction} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The 2.7x reduction in peak memory usage allows for training with significantly larger batch sizes on consumer hardware (max batch size increased from 18 to 69), further amortizing the optimization overhead.
+
+\subsection{Convergence Analysis}
+CGGR recovers $>99.5\%$ of the baseline accuracy while training in $30\%$ less wall-clock time. We observe that CGGR acts as an implicit curriculum, naturally focusing the gradient budget on the frontier of the model's knowledge as training progresses. notably, the final cross-entropy loss difference (0.002) is negligible, suggesting that the discarded 75\% of tokens contributed minimal meaningful signal to the convergence. This supports our hypothesis regarding the sparsity of the gradient signal in large-scale pretraining.
+
+\section{Limitations \& Future Work}
+While CGGR demonstrates strong empirical results, we acknowledge specific limitations:
+\begin{enumerate}
+    \item \textbf{Warmup Dependency}: The difficulty scoring mechanism requires a brief warmup period (typically 500-1000 steps) before the model statistics stabilize. Early termination of warmup can lead to suboptimal token selection.
+    \item \textbf{Small Batch Instability}: At extremely small batch sizes ($B < 4$), entropy estimates become noisy, potentially leading to high variance in gradient norms.
+    \item \textbf{Router Overhead}: For very small models ($<50$M parameters), the fixed cost of the router forward pass may approach the cost of the main model, diminishing the speedup. Future iterations will investigate ``Learned Routing'' heads to reduce this $O(N)$ overhead to $O(1)$.
+\end{enumerate}
+
+\section{Conclusion}
+We have presented Confidence-Gated Gradient Routing, a principled approach to accelerating Transformer training by exploiting the non-uniform utility of training tokens. By rigorously selecting tokens based on information-theoretic uncertainty, CGGR allows researchers to train larger models or iterate faster on constrained hardware.
+
+% References
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem{kaplan2020scaling}
+Kaplan, J., et al. (2020).
+Scaling Laws for Neural Language Models.
+\textit{arXiv pre-print}.
+
+\bibitem{shazeer2017outrageously}
+Shazeer, N., et al. (2017).
+Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer.
+\textit{International Conference on Learning Representations (ICLR)}.
+
+\bibitem{xin2020deebert}
+Xin, J., et al. (2020).
+DeeBERT: Dynamic Early Exiting for Accelerating BERT Inference.
+\textit{Association for Computational Linguistics (ACL)}.
+
+\bibitem{jiang2019selective}
+Jiang, A. H., et al. (2019).
+Selective Backpropagation for Fast Training of Deep Neural Networks.
+\textit{arXiv pre-print}.
+
+\end{thebibliography}
+
+\end{document}

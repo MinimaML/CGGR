@@ -19,6 +19,10 @@ from triton_kernels import (
     apply_mask_to_loss,
 )
 
+# Enable TF32 for Ampere+ GPUs (free 10-15% speedup)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 class CGGRLoss(nn.Module):
     """

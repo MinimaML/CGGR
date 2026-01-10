@@ -92,7 +92,9 @@ To measure "saturation" and "how quickly they learn", we will perform evaluation
 *   **Metrics:** 
     *   `pass@1` Accuracy.
     *   Total valid solutions generated.
-*   **Secondary Metric:** Validation Loss on NuminaMath held-out set.
+*   **Secondary Metric:** 
+    *   **GSM8K 8-Shot Accuracy:** To validate basic reasoning capabilities (Baseline: 1.0% -> Current: 6.0%).
+    *   Validation Loss on NuminaMath held-out set.
 
 ## Analysis Plan
 
