@@ -2,21 +2,32 @@
 CGGR Triton Kernels - With PyTorch Fallback
 ============================================
 Fused CUDA kernels for Confidence-Gated Gradient Routing.
-Falls back to PyTorch ops when Triton isn't available.
+Falls back to PyTorch ops when Triton isn't available or on non-CUDA devices.
+
+Supported Platforms:
+- CUDA (Linux/Windows): Full Triton acceleration
+- ROCm (AMD): PyTorch fallback
+- MPS (Apple Silicon): PyTorch fallback
+- CPU: PyTorch fallback
 """
 
 import torch
 import torch.nn.functional as F
 
-# Try to import Triton
+# Try to import Triton (only available on CUDA platforms)
+HAS_TRITON = False
+triton = None
+tl = None
+
 try:
     import triton
     import triton.language as tl
     HAS_TRITON = True
 except ImportError:
-    HAS_TRITON = False
-    triton = None
-    tl = None
+    pass
+except Exception:
+    # Handle any other Triton initialization errors
+    pass
 
 
 # =============================================================================
@@ -106,6 +117,76 @@ if HAS_TRITON:
         tl.store(confidence_ptr + row_idx, top1_acc)
         tl.store(entropy_ptr + row_idx, entropy_acc)
 
+    @triton.jit
+    def _mask_threshold_kernel(
+        input_ptr,
+        mask_ptr,
+        threshold,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        vals = tl.load(input_ptr + offsets, mask=mask)
+        tl.store(mask_ptr + offsets, (vals >= threshold).to(tl.float32), mask=mask)
+
+    @triton.jit
+    def _sequence_coverage_kernel(
+        difficulty_ptr,
+        mask_ptr,
+        batch_size,
+        seq_len,
+        min_tokens,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        if row_idx >= batch_size:
+            return
+            
+        row_start = row_idx * seq_len
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < seq_len
+        
+        diffs = tl.load(difficulty_ptr + row_start + offsets, mask=mask, other=-1e10)
+        masks = tl.load(mask_ptr + row_start + offsets, mask=mask, other=0.0)
+        
+        selected_count = tl.sum(masks, axis=0).to(tl.int32)
+        
+        if selected_count < min_tokens:
+            num_needed = min_tokens - selected_count
+            for _ in range(num_needed):
+                eligible = tl.where(masks == 0.0, diffs, -1e10)
+                best_idx = tl.argmax(eligible, axis=0)
+                masks = tl.where(tl.arange(0, BLOCK_SIZE) == best_idx, 1.0, masks)
+                
+            tl.store(mask_ptr + row_start + offsets, masks, mask=mask)
+
+    @triton.jit
+    def _stratified_mask_kernel(
+        difficulty_ptr,
+        mask_ptr,
+        thresholds_ptr, # [num_strata]
+        strata_counts_ptr, # [num_strata]
+        num_tokens,
+        num_strata: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_tokens
+        
+        diffs = tl.load(difficulty_ptr + offsets, mask=mask, other=-1e10)
+        
+        # For each token, determine if it passes its stratum's threshold
+        # We assign tokens to strata based on their values vs thresholds
+        # This is an approximation of rank-based stratified
+        
+        # We'll use a simpler approach for the kernel:
+        # Just a parallel thresholding based on pre-computed value thresholds.
+        # The complexity is in the wrapper.
+        pass
+
 
 # =============================================================================
 # PYTORCH FALLBACK IMPLEMENTATIONS
@@ -174,22 +255,53 @@ def _pytorch_stratified_select(
     return mask.view(difficulty.shape)
 
 
+def _pytorch_ensure_sequence_coverage(difficulty, mask, batch_size, seq_len, min_per_seq):
+    """Fallback implementation for sequence coverage."""
+    mask_2d = mask.view(batch_size, seq_len)
+    diff_2d = difficulty.view(batch_size, seq_len)
+    
+    for b in range(batch_size):
+        selected = mask_2d[b].sum().item()
+        if selected < min_per_seq:
+            need = int(min_per_seq - selected)
+            unselected = (mask_2d[b] == 0)
+            if unselected.any():
+                scores = diff_2d[b].clone()
+                scores[~unselected] = float('-inf')
+                _, top_idx = torch.topk(scores, min(need, unselected.sum().item()))
+                mask_2d[b, top_idx] = 1.0
+    
+    return mask_2d.view(mask.shape)
+
+
 # =============================================================================
-# UNIFIED API (auto-selects Triton or PyTorch)
+# UNIFIED API (auto-selects Triton or PyTorch based on device)
 # =============================================================================
+
+def _can_use_triton(tensor: torch.Tensor) -> bool:
+    """Check if Triton can be used for this tensor."""
+    if not HAS_TRITON:
+        return False
+    if not tensor.is_cuda:
+        return False
+    return True
+
 
 def fused_difficulty_score(
     logits: torch.Tensor,
     targets: torch.Tensor = None,
     mode: str = 'combined',
 ) -> tuple:
-    """Compute difficulty scores. Uses Triton if available, else PyTorch."""
+    """
+    Compute difficulty scores. Uses Triton if available on CUDA, else PyTorch.
     
-    if HAS_TRITON and logits.is_cuda:
+    Supports all devices: CUDA, MPS, CPU.
+    """
+    if _can_use_triton(logits):
         try:
             return _triton_difficulty_score(logits, targets, mode)
         except Exception:
-            # Fallback on any Triton error
+            # Fallback on any Triton error (compilation, runtime, etc.)
             pass
     
     return _pytorch_difficulty_score(logits, targets)
@@ -244,23 +356,9 @@ def compute_dynamic_threshold(
     return min(1.0, max(base_ratio * 0.5, adjusted_ratio))
 
 
-@triton.jit
-def _mask_threshold_kernel(
-    input_ptr,
-    mask_ptr,
-    threshold,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    vals = tl.load(input_ptr + offsets, mask=mask)
-    tl.store(mask_ptr + offsets, (vals >= threshold).to(tl.float32), mask=mask)
-
 def select_tokens_topk(difficulty: torch.Tensor, ratio: float) -> torch.Tensor:
-    """Top-k hardest tokens selection. Optimized with Triton for large N."""
-    if not HAS_TRITON or not difficulty.is_cuda:
+    """Top-k hardest tokens selection. Optimized with Triton for large N on CUDA."""
+    if not _can_use_triton(difficulty):
         return _pytorch_select_topk(difficulty, ratio)
     
     try:
@@ -289,73 +387,8 @@ def select_tokens_stratified(
     total_ratio: float,
     num_strata: int = 4,
 ) -> torch.Tensor:
-    """Stratified token selection across difficulty buckets."""
-    return _pytorch_stratified_select(difficulty, total_ratio, num_strata)
-
-
-@triton.jit
-def _sequence_coverage_kernel(
-    difficulty_ptr,
-    mask_ptr,
-    batch_size,
-    seq_len,
-    min_tokens,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    if row_idx >= batch_size:
-        return
-        
-    row_start = row_idx * seq_len
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < seq_len
-    
-    diffs = tl.load(difficulty_ptr + row_start + offsets, mask=mask, other=-1e10)
-    masks = tl.load(mask_ptr + row_start + offsets, mask=mask, other=0.0)
-    
-    selected_count = tl.sum(masks, axis=0).to(tl.int32)
-    
-    if selected_count < min_tokens:
-        num_needed = min_tokens - selected_count
-        for _ in range(num_needed):
-            eligible = tl.where(masks == 0.0, diffs, -1e10)
-            best_idx = tl.argmax(eligible, axis=0)
-            masks = tl.where(tl.arange(0, BLOCK_SIZE) == best_idx, 1.0, masks)
-            
-        tl.store(mask_ptr + row_start + offsets, masks, mask=mask)
-
-@triton.jit
-def _stratified_mask_kernel(
-    difficulty_ptr,
-    mask_ptr,
-    thresholds_ptr, # [num_strata]
-    strata_counts_ptr, # [num_strata]
-    num_tokens,
-    num_strata: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_tokens
-    
-    diffs = tl.load(difficulty_ptr + offsets, mask=mask, other=-1e10)
-    
-    # For each token, determine if it passes its stratum's threshold
-    # We assign tokens to strata based on their values vs thresholds
-    # This is an approximation of rank-based stratified
-    
-    # We'll use a simpler approach for the kernel:
-    # Just a parallel thresholding based on pre-computed value thresholds.
-    # The complexity is in the wrapper.
-    pass
-
-def select_tokens_stratified(
-    difficulty: torch.Tensor,
-    total_ratio: float,
-    num_strata: int = 4,
-) -> torch.Tensor:
-    """Stratified token selection. Optimized for Triton."""
-    if not HAS_TRITON or not difficulty.is_cuda:
+    """Stratified token selection. Uses hybrid Triton+PyTorch on CUDA, pure PyTorch elsewhere."""
+    if not _can_use_triton(difficulty):
         return _pytorch_stratified_select(difficulty, total_ratio, num_strata)
     
     try:
@@ -399,6 +432,7 @@ def select_tokens_stratified(
     except Exception:
         return _pytorch_stratified_select(difficulty, total_ratio, num_strata)
 
+
 def ensure_sequence_coverage(
     difficulty: torch.Tensor,
     mask: torch.Tensor,
@@ -406,8 +440,8 @@ def ensure_sequence_coverage(
     seq_len: int,
     min_per_seq: int = 1,
 ) -> torch.Tensor:
-    """Ensure minimum token coverage per sequence. Optimized with Triton."""
-    if not HAS_TRITON or not difficulty.is_cuda:
+    """Ensure minimum token coverage per sequence. Optimized with Triton on CUDA."""
+    if not _can_use_triton(difficulty):
         return _pytorch_ensure_sequence_coverage(difficulty, mask, batch_size, seq_len, min_per_seq)
         
     try:
@@ -426,23 +460,6 @@ def ensure_sequence_coverage(
     except Exception:
         return _pytorch_ensure_sequence_coverage(difficulty, mask, batch_size, seq_len, min_per_seq)
 
-def _pytorch_ensure_sequence_coverage(difficulty, mask, batch_size, seq_len, min_per_seq):
-    """Fallback implementation."""
-    mask_2d = mask.view(batch_size, seq_len)
-    diff_2d = difficulty.view(batch_size, seq_len)
-    
-    for b in range(batch_size):
-        selected = mask_2d[b].sum().item()
-        if selected < min_per_seq:
-            need = int(min_per_seq - selected)
-            unselected = (mask_2d[b] == 0)
-            if unselected.any():
-                scores = diff_2d[b].clone()
-                scores[~unselected] = float('-inf')
-                _, top_idx = torch.topk(scores, min(need, unselected.sum().item()))
-                mask_2d[b, top_idx] = 1.0
-    
-    return mask_2d.view(mask.shape)
 
 def apply_mask_to_loss(
     per_token_loss: torch.Tensor,

@@ -11,7 +11,31 @@ Selective loss computation for Transformer training. Only hard tokens contribute
 pip install cggr
 ```
 
-> Requires CUDA + Triton.
+For CUDA acceleration with Triton kernels (Linux/Windows):
+
+```bash
+pip install cggr[cuda]
+```
+
+## Platform Compatibility
+
+| Platform            | Triton Kernels | PyTorch Fallback |    Status    |
+| ------------------- | :------------: | :--------------: | :----------: |
+| CUDA (Linux)        |       ✓        |        ✓         | Full Support |
+| CUDA (Windows)      |       ✓        |        ✓         | Full Support |
+| ROCm (AMD)          |       ✗        |        ✓         |  Supported   |
+| MPS (Apple Silicon) |       ✗        |        ✓         |  Supported   |
+| CPU                 |       ✗        |        ✓         |  Supported   |
+
+## Model Architecture Support
+
+| Architecture                   | Auto-Detect | Notes                     |
+| ------------------------------ | :---------: | ------------------------- |
+| Llama/Mistral/Qwen/Gemma/Phi-3 |      ✓      | `model.layers` style      |
+| GPT-2/GPT-J/Falcon/GPT-NeoX    |      ✓      | `transformer.h` style     |
+| BERT/RoBERTa                   |      ✓      | `encoder.layer` style     |
+| Mamba/SSM                      |      ✓      | `backbone.layers` style   |
+| Other                          | Passthrough | Uses full model as router |
 
 ## Why CGGR?
 

@@ -2,12 +2,30 @@
 CGGR Unit Tests
 ===============
 Comprehensive test suite for all CGGR features.
+Supports CPU, CUDA, and MPS devices.
 """
 
 import pytest
 import torch
 import torch.nn as nn
-from cggr import CGGRLoss, CGGRWrapper
+from cggr import CGGRLoss, CGGRModel
+
+
+# =============================================================================
+# Device Detection
+# =============================================================================
+
+def get_device():
+    """Get the best available device for testing."""
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+DEVICE = get_device()
+HAS_CUDA = torch.cuda.is_available()
 
 
 # =============================================================================
@@ -18,14 +36,14 @@ from cggr import CGGRLoss, CGGRWrapper
 def sample_logits():
     """Sample logits tensor (batch=2, seq=8, vocab=100)."""
     torch.manual_seed(42)
-    return torch.randn(2, 8, 100, device='cuda', dtype=torch.float32)
+    return torch.randn(2, 8, 100, device=DEVICE, dtype=torch.float32, requires_grad=True)
 
 
 @pytest.fixture
 def sample_targets():
     """Sample targets tensor (batch=2, seq=8)."""
     torch.manual_seed(42)
-    return torch.randint(0, 100, (2, 8), device='cuda')
+    return torch.randint(0, 100, (2, 8), device=DEVICE)
 
 
 # =============================================================================
@@ -256,8 +274,8 @@ class TestEdgeCases:
     
     def test_single_token(self):
         """Should handle single token input."""
-        logits = torch.randn(1, 1, 100, device='cuda')
-        targets = torch.randint(0, 100, (1, 1), device='cuda')
+        logits = torch.randn(1, 1, 100, device=DEVICE)
+        targets = torch.randint(0, 100, (1, 1), device=DEVICE)
         
         criterion = CGGRLoss()
         loss = criterion(logits, targets)
@@ -266,8 +284,8 @@ class TestEdgeCases:
     
     def test_large_batch(self):
         """Should handle large batch."""
-        logits = torch.randn(32, 256, 100, device='cuda')
-        targets = torch.randint(0, 100, (32, 256), device='cuda')
+        logits = torch.randn(32, 256, 100, device=DEVICE)
+        targets = torch.randint(0, 100, (32, 256), device=DEVICE)
         
         criterion = CGGRLoss()
         loss = criterion(logits, targets)
@@ -276,8 +294,8 @@ class TestEdgeCases:
     
     def test_2d_input(self):
         """Should handle 2D input (N, vocab)."""
-        logits = torch.randn(64, 100, device='cuda')
-        targets = torch.randint(0, 100, (64,), device='cuda')
+        logits = torch.randn(64, 100, device=DEVICE)
+        targets = torch.randint(0, 100, (64,), device=DEVICE)
         
         criterion = CGGRLoss()
         loss = criterion(logits, targets)
@@ -286,28 +304,36 @@ class TestEdgeCases:
 
 
 # =============================================================================
-# Triton Kernel Tests
+# Triton Kernel Tests (CUDA only)
 # =============================================================================
 
 class TestTritonKernels:
-    """Test Triton kernel functionality."""
+    """Test Triton kernel functionality (CUDA only)."""
     
+    @pytest.mark.skipif(not HAS_CUDA, reason="CUDA required for Triton tests")
     def test_fused_difficulty_score(self, sample_logits, sample_targets):
         """Fused difficulty score should return correct shapes."""
         from triton_kernels import fused_difficulty_score
         
-        difficulty, confidence, entropy = fused_difficulty_score(sample_logits, sample_targets)
+        # Ensure tensors are on CUDA for this test
+        logits = sample_logits.cuda() if not sample_logits.is_cuda else sample_logits
+        targets = sample_targets.cuda() if not sample_targets.is_cuda else sample_targets
         
-        expected_shape = sample_logits.shape[:-1]  # (batch, seq)
+        difficulty, confidence, entropy = fused_difficulty_score(logits, targets)
+        
+        expected_shape = logits.shape[:-1]  # (batch, seq)
         assert difficulty.shape == expected_shape
         assert confidence.shape == expected_shape
         assert entropy.shape == expected_shape
     
+    @pytest.mark.skipif(not HAS_CUDA, reason="CUDA required for Triton tests")
     def test_select_tokens_topk(self, sample_logits):
         """Top-k selection should return valid mask."""
         from triton_kernels import fused_difficulty_score, select_tokens_topk
         
-        difficulty, _, _ = fused_difficulty_score(sample_logits)
+        logits = sample_logits.cuda() if not sample_logits.is_cuda else sample_logits
+        
+        difficulty, _, _ = fused_difficulty_score(logits)
         mask = select_tokens_topk(difficulty, ratio=0.5)
         
         assert mask.shape == difficulty.shape
@@ -315,14 +341,59 @@ class TestTritonKernels:
         assert (mask >= 0).all()
         assert (mask <= 1).all()
     
+    @pytest.mark.skipif(not HAS_CUDA, reason="CUDA required for Triton tests")
     def test_select_tokens_stratified(self, sample_logits):
         """Stratified selection should return valid mask."""
         from triton_kernels import fused_difficulty_score, select_tokens_stratified
         
-        difficulty, _, _ = fused_difficulty_score(sample_logits)
+        logits = sample_logits.cuda() if not sample_logits.is_cuda else sample_logits
+        
+        difficulty, _, _ = fused_difficulty_score(logits)
         mask = select_tokens_stratified(difficulty, total_ratio=0.5, num_strata=4)
         
         assert mask.shape == difficulty.shape
+
+
+# =============================================================================
+# PyTorch Fallback Tests
+# =============================================================================
+
+class TestPyTorchFallback:
+    """Test PyTorch fallback implementations work correctly."""
+    
+    def test_fallback_difficulty_score(self):
+        """PyTorch fallback should produce valid scores."""
+        from triton_kernels import _pytorch_difficulty_score
+        
+        logits = torch.randn(2, 8, 100)
+        difficulty, confidence, entropy = _pytorch_difficulty_score(logits)
+        
+        assert difficulty.shape == (2, 8)
+        assert confidence.shape == (2, 8)
+        assert entropy.shape == (2, 8)
+        assert torch.all(confidence >= 0) and torch.all(confidence <= 1)
+        assert torch.all(entropy >= 0)
+    
+    def test_fallback_topk_selection(self):
+        """PyTorch fallback top-k should work correctly."""
+        from triton_kernels import _pytorch_select_topk
+        
+        difficulty = torch.randn(16)
+        mask = _pytorch_select_topk(difficulty, ratio=0.5)
+        
+        assert mask.shape == difficulty.shape
+        assert mask.sum() == 8  # 50% of 16 tokens
+    
+    def test_fallback_stratified_selection(self):
+        """PyTorch fallback stratified should work correctly."""
+        from triton_kernels import _pytorch_stratified_select
+        
+        difficulty = torch.randn(100)
+        mask = _pytorch_stratified_select(difficulty, total_ratio=0.5, num_strata=4)
+        
+        assert mask.shape == difficulty.shape
+        # Should select some tokens (not exact due to rounding)
+        assert mask.sum() > 0
 
 
 # =============================================================================

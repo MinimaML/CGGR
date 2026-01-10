@@ -20,8 +20,10 @@ from triton_kernels import (
 )
 
 # Enable TF32 for Ampere+ GPUs (free 10-15% speedup)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+# Only set these if CUDA is available to avoid errors on other platforms
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 class CGGRLoss(nn.Module):
@@ -187,71 +189,154 @@ class TruncatedRouter(nn.Module):
     """
     Lightweight proxy model for difficulty scoring.
     Constructed by slicing a full model (sharing weights).
+    
+    Supported Architectures:
+    - Llama/Mistral/Qwen/Gemma/Phi-3 (model.layers, embed_tokens, norm)
+    - GPT-2/GPT-J/Falcon/GPT-NeoX (transformer.h, wte, ln_f)
+    - BERT/RoBERTa (encoder.layer, embeddings)
+    - Mamba/SSM (backbone.layers)
+    - Passthrough (any model - uses model directly as router)
     """
-    def __init__(self, model: nn.Module, num_layers: int = 2):
+    
+    # Architecture detection patterns
+    ARCH_PATTERNS = {
+        'llama': {'base': 'model', 'layers': 'layers', 'embed': 'embed_tokens', 'norm': 'norm'},
+        'gpt': {'base': 'transformer', 'layers': 'h', 'embed': 'wte', 'norm': 'ln_f'},
+        'bert': {'base': 'encoder', 'layers': 'layer', 'embed': None, 'norm': None},
+        'mamba': {'base': 'backbone', 'layers': 'layers', 'embed': 'embedding', 'norm': 'norm_f'},
+    }
+    
+    def __init__(self, model: nn.Module, num_layers: int = 2, architecture: str = 'auto'):
         super().__init__()
         import copy
         
-        # Heuristics for common architectures
-        if hasattr(model, 'model'):
-            # Llama/Mistral/Qwen style
-            base_model = model.model
-            self.style = 'llama'
-        elif hasattr(model, 'transformer'):
-            # GPT-2/GPT-J/Falcon style
-            base_model = model.transformer
-            self.style = 'gpt'
-        else:
-            raise ValueError("Unsupported model architecture for automatic truncation. Please provide a custom router.")
-
+        self.num_layers = num_layers
+        self.style = architecture
+        self.passthrough = False
+        
+        # Auto-detect architecture
+        if architecture == 'auto':
+            self.style = self._detect_architecture(model)
+        
+        # Special case: passthrough mode (use model directly)
+        if self.style == 'passthrough':
+            self.passthrough = True
+            self.model = model
+            self.head = model.lm_head if hasattr(model, 'lm_head') else None
+            return
+        
+        # Get architecture pattern
+        pattern = self.ARCH_PATTERNS.get(self.style)
+        if pattern is None:
+            raise ValueError(
+                f"Unknown architecture '{self.style}'. Supported: {list(self.ARCH_PATTERNS.keys())} or 'passthrough'. "
+                f"Use architecture='passthrough' to use the full model as router."
+            )
+        
+        # Get base model
+        base_model = getattr(model, pattern['base'], None)
+        if base_model is None:
+            raise ValueError(
+                f"Model does not have '{pattern['base']}' attribute expected for {self.style} architecture. "
+                f"Detected attributes: {[a for a in dir(model) if not a.startswith('_')]}. "
+                f"Try architecture='passthrough' or provide a custom router."
+            )
+        
         # Clone config and truncate layers
         config = copy.deepcopy(model.config)
+        self._truncate_config(config, num_layers)
+        
+        # Instantiate mini-model (random weights initially)
+        cls = base_model.__class__
+        try:
+            self.mini_model = cls(config)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to create truncated model: {e}. "
+                f"Try architecture='passthrough' or provide a custom router."
+            )
+        
+        # Share weights
+        self._share_weights(base_model, model, pattern, num_layers)
+            
+    def _detect_architecture(self, model: nn.Module) -> str:
+        """Auto-detect model architecture."""
+        # Check for each known pattern
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            return 'llama'
+        elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
+            return 'gpt'
+        elif hasattr(model, 'encoder') and hasattr(model.encoder, 'layer'):
+            return 'bert'
+        elif hasattr(model, 'backbone') and hasattr(model.backbone, 'layers'):
+            return 'mamba'
+        else:
+            # Fallback to passthrough
+            import warnings
+            warnings.warn(
+                f"Could not auto-detect architecture for {type(model).__name__}. "
+                f"Using passthrough mode (full model as router). "
+                f"For better performance, provide a custom router or specify architecture explicitly."
+            )
+            return 'passthrough'
+    
+    def _truncate_config(self, config, num_layers: int):
+        """Truncate layer count in config."""
         if hasattr(config, 'num_hidden_layers'):
             config.num_hidden_layers = num_layers
         elif hasattr(config, 'n_layer'):
             config.n_layer = num_layers
-        
-        # Instantiate mini-model (random weights initially)
-        cls = base_model.__class__
-        self.mini_model = cls(config)
-        
-        # Share weights (Overwrite with references)
+        elif hasattr(config, 'num_layers'):
+            config.num_layers = num_layers
+        elif hasattr(config, 'n_layers'):
+            config.n_layers = num_layers
+    
+    def _share_weights(self, base_model: nn.Module, full_model: nn.Module, pattern: dict, num_layers: int):
+        """Share weights between full model and mini model."""
         # 1. Embeddings
-        if hasattr(base_model, 'embed_tokens'):
-            self.mini_model.embed_tokens = base_model.embed_tokens
-        elif hasattr(base_model, 'wte'):
-            self.mini_model.wte = base_model.wte
-            self.mini_model.wpe = getattr(base_model, 'wpe', None)
-            
+        embed_attr = pattern.get('embed')
+        if embed_attr and hasattr(base_model, embed_attr):
+            setattr(self.mini_model, embed_attr, getattr(base_model, embed_attr))
+        # GPT-style also has positional embeddings
+        if self.style == 'gpt' and hasattr(base_model, 'wpe'):
+            self.mini_model.wpe = base_model.wpe
+        
         # 2. Layers
-        if hasattr(base_model, 'layers'):
-            for i in range(num_layers):
-                self.mini_model.layers[i] = base_model.layers[i]
-        elif hasattr(base_model, 'h'):
-            for i in range(num_layers):
-                self.mini_model.h[i] = base_model.h[i]
+        layers_attr = pattern.get('layers')
+        if layers_attr:
+            src_layers = getattr(base_model, layers_attr, None)
+            dst_layers = getattr(self.mini_model, layers_attr, None)
+            if src_layers is not None and dst_layers is not None:
+                for i in range(min(num_layers, len(src_layers), len(dst_layers))):
+                    dst_layers[i] = src_layers[i]
         
         # 3. Norm
-        if hasattr(base_model, 'norm'):
-            self.mini_model.norm = base_model.norm
-        elif hasattr(base_model, 'ln_f'):
-            self.mini_model.ln_f = base_model.ln_f
+        norm_attr = pattern.get('norm')
+        if norm_attr and hasattr(base_model, norm_attr):
+            setattr(self.mini_model, norm_attr, getattr(base_model, norm_attr))
         
-        # 4. Rotary Embeddings (if present, share reference)
+        # 4. Rotary Embeddings (if present)
         if hasattr(base_model, 'rotary_emb'):
-            # For Models that store rotary_emb in the base model
             self.mini_model.rotary_emb = base_model.rotary_emb
-            
-        # 5. Head (not part of base model usually)
-        self.head = model.lm_head if hasattr(model, 'lm_head') else None
+        
+        # 5. Head
+        self.head = full_model.lm_head if hasattr(full_model, 'lm_head') else None
             
     def forward(self, input_ids: torch.Tensor, **kwargs):
+        # Passthrough mode: use full model directly
+        if self.passthrough:
+            outputs = self.model(input_ids, **kwargs)
+            if hasattr(outputs, 'logits'):
+                return outputs.logits
+            return outputs[0] if isinstance(outputs, tuple) else outputs
+        
         # Forward through mini-base-model
-        # This handles all position_ids, masking, and rotary embeddings correctly!
         outputs = self.mini_model(input_ids, **kwargs)
         
         # Get hidden states
-        hidden_states = outputs[0]
+        hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+        if hasattr(outputs, 'last_hidden_state'):
+            hidden_states = outputs.last_hidden_state
         
         # Project to logits using head
         if self.head is not None:
