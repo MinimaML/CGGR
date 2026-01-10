@@ -20,7 +20,6 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
-book/
 ignore/
 # Virtual Env
 venv/
@@ -30,10 +29,6 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
-
-# Private planning
-CGGR_V2_PLAN.md
-CGGR_WHITEPAPER.md
 
 # Logs and Temps
 mdpdf.log
@@ -48,15 +43,8 @@ results/
 tests/
 examples/
 # User Docs/Images
-# User Docs/Images
-PYLON2.md
-benchmark_plan.md
-benchmark_report.md
-learning_path.md
-docs.md
 *.ipynb
 *.json
 *.png
 *.pdf
 
-!CGGR_The_Foundations_of_Modern_Intelligence.pdf
