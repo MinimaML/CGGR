@@ -21,6 +21,7 @@ wheels/
 *.egg
 MANIFEST
 book/
+ignore/
 # Virtual Env
 venv/
 env/
