@@ -39,6 +39,14 @@ except ImportError:
     HAS_WANDB = False
     wandb = None
 
+# Flash Attention
+try:
+    from cggr_flash import enable_flash_attention, get_flash_attention_info, HAS_SDPA
+    HAS_FLASH = True
+except ImportError:
+    HAS_FLASH = False
+    HAS_SDPA = False
+
 
 # =============================================================================
 # DATA
@@ -225,6 +233,7 @@ def run_training(
     checkpoint_interval_min: int = 60,
     use_wandb: bool = False,
     wandb_project: str = "cggr-math-benchmark",
+    flash_attention: bool = True,
 ) -> Dict[str, Any]:
     """Run extended training."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -256,9 +265,24 @@ def run_training(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float32  # Use float32, let autocast handle precision
-    ).to(device)
+    # Determine attention implementation
+    attn_impl = 'eager'
+    if flash_attention and HAS_FLASH:
+        info = get_flash_attention_info()
+        attn_impl = info['recommended_backend']
+        console.print(f"[green]✓ Flash Attention: {attn_impl}[/green]")
+    
+    # Load with flash attention if available
+    if attn_impl in ['flash_attention_2', 'sdpa']:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            attn_implementation=attn_impl,
+        ).to(device)
+    else:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.float32
+        ).to(device)
     
     if hasattr(base_model, 'gradient_checkpointing_enable'):
         base_model.gradient_checkpointing_enable()
@@ -493,6 +517,8 @@ def main():
     parser.add_argument("--checkpoint-interval", type=int, default=60, help="Checkpoint interval in minutes")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb-project", default="cggr-math-benchmark", help="W&B project name")
+    parser.add_argument("--flash-attention", action="store_true", default=True, help="Enable Flash Attention (default: True)")
+    parser.add_argument("--no-flash-attention", dest="flash_attention", action="store_false", help="Disable Flash Attention")
     
     args = parser.parse_args()
     
@@ -508,6 +534,7 @@ def main():
             learning_rate=args.lr, eval_interval_min=args.eval_interval,
             checkpoint_interval_min=args.checkpoint_interval,
             use_wandb=args.wandb, wandb_project=args.wandb_project,
+            flash_attention=args.flash_attention,
         )
         
         # Then CGGR
@@ -518,6 +545,7 @@ def main():
             learning_rate=args.lr, eval_interval_min=args.eval_interval,
             checkpoint_interval_min=args.checkpoint_interval,
             use_wandb=args.wandb, wandb_project=args.wandb_project,
+            flash_attention=args.flash_attention,
         )
         
         # Compare
@@ -531,6 +559,7 @@ def main():
             learning_rate=args.lr, eval_interval_min=args.eval_interval,
             checkpoint_interval_min=args.checkpoint_interval,
             use_wandb=args.wandb, wandb_project=args.wandb_project,
+            flash_attention=args.flash_attention,
         )
     else:
         parser.print_help()
