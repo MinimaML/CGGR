@@ -29,7 +29,7 @@ pip install cggr
 **Dataset:** AI-MO/NuminaMath-1.5  
 **Evaluation:** AIME 2024 (Math Reasoning)  
 
-> [!TIP]
+> [!IMPORTANT]
 > **Key Result:** CGGR achieved 4x higher sample throughput and +1.5% Accuracy by utilizing idle compute cycles.
 
 | Metric                      | Standard (BS=1) | CGGR (BS=4) | Improvement |
