@@ -25,26 +25,26 @@ pip install cggr
 
 ## Benchmark Race Results (2026)
 
-**Model:** Google Gemma-3-4B-IT  
+**Model:** HuggingFaceTB/SmolLM-135M  
 **Dataset:** AI-MO/NuminaMath-1.5  
 **Evaluation:** AIME 2024 (Math Reasoning)  
 
 > [!TIP]
-> **Key Result:** CGGR achieved **4x higher sample throughput** and **+1.5% Accuracy** by utilizing idle compute cycles.
+> **Key Result:** CGGR achieved 4x higher sample throughput and +1.5% Accuracy by utilizing idle compute cycles.
 
 | Metric                      | Standard (BS=1) | CGGR (BS=4) | Improvement |
 | :-------------------------- | :-------------- | :---------- | :---------- |
 | **Final Accuracy (AIME)**   | 8.00%           | **9.50%**   | **+1.50%**  |
 | **Final Loss**              | 0.3610          | **0.0980**  | **-73%**    |
 | **Total Samples Processed** | ~14,368         | ~58,716     | **4.08x**   |
-| **Wall Clock Time**         | 1.5 Hours       | 1.5 Hours   | Same        |
+| **Wall Clock Time**         | 6 Hours         | 6 Hours     | Same        |
 
 ### The "Free Lunch" Phenomenon
-In standard training (Batch Size = 1), high-end GPUs are often **latency-bound**—spending more time waiting for memory transfers than doing math. 
+In standard training (Batch Size = 1), high-end GPUs are often latency-bound, spending more time waiting for memory transfers than doing math. 
 
-CGGR exploits this by **quadrupling the batch size** (Batch Size = 4) without increasing the step time.
+CGGR exploits this by quadrupling the batch size (Batch Size = 4) without increasing the step time.
 *   **Step Latency:** Unchanged (1.02x throughput ratio in steps/sec).
-*   **Data Throughput:** **4.08x higher** (samples/sec).
+*   **Data Throughput:** 4.08x higher (samples/sec).
 
 By processing 4x more data in the same timeframe, CGGR converges significantly faster and deeper (Loss 0.09 vs 0.36).
 
