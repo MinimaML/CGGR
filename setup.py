@@ -20,7 +20,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/MinimaML/CGGR",
     author="MinimaML",
-    py_modules=["cggr", "triton_kernels", "cggr_async", "cggr_checkpointing", "cggr_dataloader"],
+    py_modules=["cggr", "triton_kernels", "cggr_async", "cggr_checkpointing", "cggr_dataloader", "cggr_flash"],
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Science/Research",
@@ -36,10 +36,11 @@ setup(
     ],
     install_requires=install_requires,
     extras_require={
-        "cuda": ["triton>=2.0.0"],  # For CUDA acceleration
+        "cuda": ["triton>=2.0.0"],  # For Triton kernel acceleration
+        "flash": ["flash-attn>=2.0.0"],  # For Flash Attention 2
         "dev": ["pytest", "rich"],
         "benchmark": ["transformers", "rich"],
-        "all": ["triton>=2.0.0", "transformers", "rich", "pytest"],
+        "all": ["triton>=2.0.0", "flash-attn>=2.0.0", "transformers", "rich", "pytest"],
     },
     python_requires=">=3.8",
 )

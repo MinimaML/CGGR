@@ -37,6 +37,33 @@ pip install cggr[cuda]
 | Mamba/SSM                      |      ✓      | `backbone.layers` style   |
 | Other                          | Passthrough | Uses full model as router |
 
+## Flash Attention Support
+
+CGGR supports Flash Attention for memory-efficient attention computation:
+
+```bash
+# Install with Flash Attention support
+pip install cggr[flash]
+```
+
+```python
+from cggr_flash import load_model_with_flash_attention, enable_flash_attention
+
+# Option 1: Load model with Flash Attention
+model = load_model_with_flash_attention("microsoft/phi-2")
+
+# Option 2: Enable on existing model
+from transformers import AutoModelForCausalLM
+model = AutoModelForCausalLM.from_pretrained("...")
+model = enable_flash_attention(model)  # Auto-selects best backend
+```
+
+| Backend             | Requirements       | Speed    |
+| ------------------- | ------------------ | -------- |
+| `flash_attention_2` | flash-attn library | Fastest  |
+| `sdpa`              | PyTorch 2.0+       | Fast     |
+| `eager`             | None               | Baseline |
+
 ## Why CGGR?
 
 | Metric              | Standard Training      | CGGR (Batch Split)      | Benefit                           |
