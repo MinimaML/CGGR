@@ -553,4 +553,21 @@ __all__ = [
 # from cggr_async import AsyncCGGRScorer, AsyncCGGRModel
 # from cggr_dataloader import NanoRouter, DifficultyFilteredDataLoader
 
+# Persistent CGGR Kernels (optional - for Token-Routed MLP optimization)
+try:
+    from persistent_cggr_kernels import (
+        PersistentTRMLP,
+        PersistentKernelConfig,
+        create_persistent_tr_mlp,
+        persistent_grouped_gemm,
+    )
+    __all__.extend([
+        'PersistentTRMLP',
+        'PersistentKernelConfig', 
+        'create_persistent_tr_mlp',
+        'persistent_grouped_gemm',
+    ])
+except ImportError:
+    pass
+
 

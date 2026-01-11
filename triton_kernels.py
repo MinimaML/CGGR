@@ -483,3 +483,29 @@ class TritonGradientMask(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output, None, None, None
+
+
+# =============================================================================
+# PERSISTENT CGGR KERNEL INTEGRATION
+# =============================================================================
+
+# Import persistent kernels (if available)
+try:
+    from persistent_cggr_kernels import (
+        PersistentTRMLP,
+        PersistentKernelConfig,
+        CooperativeThreadGroup,
+        SoftwarePipeline,
+        create_persistent_tr_mlp,
+        persistent_grouped_gemm,
+        HAS_TRITON as PERSISTENT_HAS_TRITON,
+    )
+    HAS_PERSISTENT_KERNELS = True
+except ImportError:
+    HAS_PERSISTENT_KERNELS = False
+    PersistentTRMLP = None
+    PersistentKernelConfig = None
+    CooperativeThreadGroup = None
+    SoftwarePipeline = None
+    create_persistent_tr_mlp = None
+    persistent_grouped_gemm = None
