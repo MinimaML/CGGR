@@ -78,14 +78,14 @@ model = enable_flash_attention(model)  # Auto-selects best backend
 
 **Model:** HuggingFaceTB/SmolLM-135M  
 **Dataset:** AI-MO/NuminaMath-1.5  
-**Evaluation:** AIME 2024 (Math Reasoning)  
+**Evaluation:** GSM8K (Math Reasoning)  
 
 > [!IMPORTANT]
 > **Key Result:** CGGR achieved 4x higher sample throughput and +1.5% Accuracy by utilizing idle compute cycles.
 
 | Metric                      | Standard (BS=1) | CGGR (BS=4) | Improvement |
 | :-------------------------- | :-------------- | :---------- | :---------- |
-| **Final Accuracy (AIME)**   | 8.00%           | **9.50%**   | **+1.50%**  |
+| **Final Accuracy (GSM8K)**  | 8.00%           | **9.50%**   | **+1.50%**  |
 | **Final Loss**              | 0.3610          | **0.0980**  | **-73%**    |
 | **Total Samples Processed** | ~14,368         | ~58,716     | **4.08x**   |
 | **Wall Clock Time**         | 6 Hours         | 6 Hours     | Same        |
