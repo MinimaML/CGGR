@@ -75,8 +75,15 @@ class AsyncCGGRScorer(nn.Module):
         Call this with the NEXT batch's input_ids while the current batch is training.
         """
         if self._scoring_stream is None:
-            # CPU fallback: just compute synchronously
-            self._prefetched = self._score_sync(input_ids, **kwargs)
+            # CPU fallback: just compute synchronously and wrap in PrefetchedMask
+            difficulty, mask, info = self._score_sync(input_ids, **kwargs)
+            self._prefetch_input_ids = input_ids
+            self._prefetched = PrefetchedMask(
+                difficulty=difficulty,
+                mask=mask,
+                info=info,
+                ready=True,
+            )
             return
         
         # Store input for verification during get_mask
@@ -121,7 +128,9 @@ class AsyncCGGRScorer(nn.Module):
             self._prefetch_input_ids = None
             return result.difficulty, result.mask, result.info
         
-        # Cache miss: compute synchronously
+        # Cache miss: compute synchronously and clear any stale prefetch state
+        self._prefetched = None
+        self._prefetch_input_ids = None
         return self._score_sync(input_ids, **kwargs)
     
     def _score_sync(self, input_ids: torch.Tensor, **kwargs):
@@ -198,15 +207,26 @@ class AsyncCGGRModel(nn.Module):
             self.async_scorer.prefetch(next_input_ids, **kwargs)
         
         # Select hard sequences
-        seq_difficulty = difficulty.view(batch_size, seq_len).mean(dim=-1)
+        # Use attention_mask to exclude padding tokens when computing sequence difficulty
+        attention_mask = kwargs.get('attention_mask')
+        diff_2d = difficulty.view(batch_size, seq_len)
+        if attention_mask is not None:
+            attn_2d = attention_mask.view(batch_size, seq_len).float()
+            seq_difficulty = (diff_2d * attn_2d).sum(dim=-1) / (attn_2d.sum(dim=-1) + 1e-8)
+        else:
+            seq_difficulty = diff_2d.mean(dim=-1)
         k = max(1, int(batch_size * current_ratio))
         _, hard_seq_indices = torch.topk(seq_difficulty, k)
         
         # Forward on hard sequences only
         hard_input_ids = input_ids[hard_seq_indices]
         hard_labels = labels[hard_seq_indices]
+        hard_kwargs = {
+            key: val[hard_seq_indices] if isinstance(val, torch.Tensor) and val.shape[0] == batch_size else val
+            for key, val in kwargs.items()
+        }
         
-        hard_outputs = self.model(hard_input_ids, **kwargs)
+        hard_outputs = self.model(hard_input_ids, **hard_kwargs)
         
         if hasattr(hard_outputs, 'logits'):
             hard_logits = hard_outputs.logits
@@ -215,7 +235,7 @@ class AsyncCGGRModel(nn.Module):
         
         shift_logits = hard_logits[:, :-1, :].contiguous().view(-1, hard_logits.shape[-1])
         shift_labels = hard_labels[:, 1:].contiguous().view(-1)
-        loss = nn.functional.cross_entropy(shift_logits, shift_labels)
+        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
         
         self.metrics = {
             'step': self.async_scorer.scorer.step_count.item(),

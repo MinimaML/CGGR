@@ -8,7 +8,7 @@ Supports CPU, CUDA, and MPS devices.
 import pytest
 import torch
 import torch.nn as nn
-from cggr import CGGRLoss, CGGRModel
+from cggr import CGGRLoss, CGGRModel, CGGRScorer
 
 
 # =============================================================================
@@ -394,6 +394,191 @@ class TestPyTorchFallback:
         assert mask.shape == difficulty.shape
         # Should select some tokens (not exact due to rounding)
         assert mask.sum() > 0
+
+
+# =============================================================================
+# New feature / bug-fix regression tests
+# =============================================================================
+
+class TestIgnoreIndex:
+    """Tests for ignore_index (padding token) support in CGGRLoss."""
+
+    def test_ignore_index_tokens_not_selected(self):
+        """Padding tokens (target == ignore_index) should never be selected."""
+        torch.manual_seed(0)
+        logits = torch.randn(2, 8, 100, device=DEVICE)
+        # Mark the last 4 tokens in each sequence as padding
+        targets = torch.randint(0, 100, (2, 8), device=DEVICE)
+        targets[:, 4:] = -100  # padding
+
+        criterion = CGGRLoss(
+            min_tokens_ratio=0.5,
+            warmup_steps=0,
+            dynamic_threshold=False,
+        )
+        criterion.step_count.fill_(1000)
+
+        with torch.no_grad():
+            from triton_kernels import fused_difficulty_score, select_tokens_topk
+            import torch.nn.functional as F
+
+            logits_flat = logits.view(-1, 100)
+            targets_flat = targets.view(-1)
+            valid_mask = targets_flat != -100
+
+            difficulty, confidence, entropy = fused_difficulty_score(
+                logits_flat, targets=None, mode='combined'
+            )
+            difficulty = difficulty.view(-1)
+            # Suppress padding positions
+            difficulty_masked = difficulty.masked_fill(~valid_mask, float('-inf'))
+            mask = select_tokens_topk(difficulty_masked, 0.5)
+
+        # No padding tokens should be selected
+        selected = mask.view(-1)[~valid_mask]
+        assert selected.sum().item() == 0, "Padding tokens must not be selected"
+
+    def test_ignore_index_loss_is_finite(self):
+        """Loss should be finite even when many tokens are padding."""
+        logits = torch.randn(2, 8, 100, device=DEVICE)
+        targets = torch.randint(0, 100, (2, 8), device=DEVICE)
+        targets[:, 6:] = -100  # heavy padding
+
+        criterion = CGGRLoss(ignore_index=-100, min_tokens_ratio=0.5, warmup_steps=0, dynamic_threshold=False)
+        criterion.step_count.fill_(1000)
+        loss = criterion(logits, targets)
+
+        assert torch.isfinite(loss), "Loss must be finite with padded targets"
+        assert loss.item() > 0
+
+    def test_custom_ignore_index(self):
+        """Custom ignore_index value should be respected."""
+        logits = torch.randn(4, 10, 50, device=DEVICE)
+        targets = torch.randint(0, 50, (4, 10), device=DEVICE)
+        targets[:, 8:] = 0  # use 0 as ignore_index
+
+        criterion = CGGRLoss(ignore_index=0, min_tokens_ratio=0.5, warmup_steps=0, dynamic_threshold=False)
+        criterion.step_count.fill_(1000)
+        loss = criterion(logits, targets)
+
+        assert torch.isfinite(loss)
+
+
+class TestCGGRScorerScoring:
+    """Tests that CGGRScorer correctly exposes the scoring parameter."""
+
+    @pytest.mark.parametrize("scoring", ['entropy', 'margin', 'loss', 'combined'])
+    def test_scoring_parameter_accepted(self, scoring):
+        """CGGRScorer should accept and use the scoring parameter."""
+        router = nn.Linear(100, 50)  # dummy router
+
+        class DummyRouter(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                # return (batch, seq, vocab) logits
+                return torch.randn(input_ids.shape[0], input_ids.shape[1], 50)
+
+        scorer = CGGRScorer(
+            router=DummyRouter(),
+            scoring=scoring,
+            min_tokens_ratio=0.5,
+            warmup_steps=0,
+        )
+        assert scorer.scoring == scoring
+
+    def test_default_scoring_is_combined(self):
+        """Default scoring should be 'combined'."""
+        class DummyRouter(nn.Module):
+            def forward(self, x, **kwargs):
+                return torch.randn(x.shape[0], x.shape[1], 50)
+
+        scorer = CGGRScorer(router=DummyRouter())
+        assert scorer.scoring == 'combined'
+
+
+class TestDynamicThresholdFloor:
+    """Tests that dynamic threshold never drops below the curriculum base_ratio."""
+
+    def test_dynamic_threshold_never_below_base_ratio(self):
+        """compute_dynamic_threshold should never return less than base_ratio."""
+        from triton_kernels import compute_dynamic_threshold
+
+        # Even with very high confidence the floor should be base_ratio
+        high_conf = torch.ones(100) * 0.99
+        base_ratio = 0.25
+        result = compute_dynamic_threshold(high_conf, base_ratio, sensitivity=0.5)
+        assert result >= base_ratio, (
+            f"Dynamic threshold {result} dropped below base_ratio {base_ratio}"
+        )
+
+    def test_dynamic_threshold_increases_when_low_confidence(self):
+        """With low confidence, threshold should be >= base_ratio."""
+        from triton_kernels import compute_dynamic_threshold
+
+        low_conf = torch.zeros(100)  # zero confidence → maximum adjustment
+        base_ratio = 0.25
+        result = compute_dynamic_threshold(low_conf, base_ratio, sensitivity=0.5)
+        assert result >= base_ratio
+        assert result <= 1.0
+
+
+class TestAsyncScorerCPUFallback:
+    """Tests that AsyncCGGRScorer works correctly on CPU (no CUDA stream)."""
+
+    def test_prefetch_and_get_mask_cpu(self):
+        """CPU fallback: prefetch + get_mask should return the same result."""
+        from cggr_async import AsyncCGGRScorer
+
+        class DummyRouter(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return torch.randn(input_ids.shape[0], input_ids.shape[1], 50)
+
+        scorer = AsyncCGGRScorer(
+            router=DummyRouter(),
+            min_tokens_ratio=0.5,
+            warmup_steps=0,
+        )
+
+        input_ids = torch.randint(0, 100, (2, 8))
+
+        # Prefetch
+        scorer.prefetch(input_ids)
+        assert scorer._prefetched is not None
+        assert scorer._prefetched.ready
+
+        # get_mask should return the prefetched result
+        difficulty, mask, info = scorer.get_mask(input_ids)
+        assert difficulty is not None
+        assert mask is not None
+        assert 'current_ratio' in info
+
+        # Cache should be cleared after retrieval
+        assert scorer._prefetched is None
+        assert scorer._prefetch_input_ids is None
+
+    def test_cache_cleared_on_miss(self):
+        """On a cache miss, stale prefetch state should be cleared."""
+        from cggr_async import AsyncCGGRScorer
+
+        class DummyRouter(nn.Module):
+            def forward(self, input_ids, **kwargs):
+                return torch.randn(input_ids.shape[0], input_ids.shape[1], 50)
+
+        scorer = AsyncCGGRScorer(
+            router=DummyRouter(),
+            min_tokens_ratio=0.5,
+            warmup_steps=0,
+        )
+
+        batch_a = torch.randint(0, 100, (2, 8))
+        batch_b = torch.randint(0, 100, (2, 8))
+
+        # Prefetch batch_a, then request batch_b → cache miss
+        scorer.prefetch(batch_a)
+        scorer.get_mask(batch_b)  # cache miss
+
+        # Stale state must be cleared
+        assert scorer._prefetched is None
+        assert scorer._prefetch_input_ids is None
 
 
 # =============================================================================
