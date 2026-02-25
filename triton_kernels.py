@@ -353,7 +353,8 @@ def compute_dynamic_threshold(
     """Compute dynamic token ratio based on batch confidence."""
     mean_conf = confidence.mean().item()
     adjusted_ratio = base_ratio * (1.0 + (1.0 - mean_conf) * sensitivity)
-    return min(1.0, max(base_ratio * 0.5, adjusted_ratio))
+    # Floor is base_ratio so we never select fewer tokens than the curriculum requests
+    return min(1.0, max(base_ratio, adjusted_ratio))
 
 
 def select_tokens_topk(difficulty: torch.Tensor, ratio: float) -> torch.Tensor:

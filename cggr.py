@@ -50,6 +50,7 @@ class CGGRLoss(nn.Module):
         
         num_strata: Buckets for stratified sampling
         min_tokens_per_sequence: Minimum coverage per sequence
+        ignore_index: Target value to ignore in loss (default -100, matches HuggingFace)
     """
     
     def __init__(
@@ -63,6 +64,7 @@ class CGGRLoss(nn.Module):
         num_strata: int = 4,
         min_tokens_per_sequence: int = 1,
         base_loss: nn.Module = None,
+        ignore_index: int = -100,
     ):
         super().__init__()
         
@@ -74,7 +76,8 @@ class CGGRLoss(nn.Module):
         self.warmup_steps = warmup_steps
         self.num_strata = num_strata
         self.min_tokens_per_sequence = min_tokens_per_sequence
-        self.base_loss = base_loss or nn.CrossEntropyLoss(reduction='none')
+        self.ignore_index = ignore_index
+        self.base_loss = base_loss or nn.CrossEntropyLoss(reduction='none', ignore_index=ignore_index)
         
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
         self.metrics = {}
@@ -110,6 +113,9 @@ class CGGRLoss(nn.Module):
         
         # STEP 1: Compute difficulty scores to select tokens (no grad needed)
         with torch.no_grad():
+            # Mask out padding positions so they don't skew difficulty scores or selection
+            valid_mask = targets_flat != self.ignore_index  # True for non-padding tokens
+
             # Compute difficulty from logits (fast - just softmax + entropy)
             difficulty, confidence, entropy = fused_difficulty_score(
                 logits_flat.unsqueeze(0) if logits_flat.dim() == 2 else logits_flat,
@@ -119,6 +125,12 @@ class CGGRLoss(nn.Module):
             difficulty = difficulty.view(-1)
             confidence = confidence.view(-1)
             entropy = entropy.view(-1)
+
+            # Suppress difficulty of padding tokens so they are never selected
+            if not valid_mask.all():
+                difficulty = difficulty.masked_fill(~valid_mask, float('-inf'))
+                confidence = confidence[valid_mask] if valid_mask.any() else confidence
+                entropy = entropy[valid_mask] if valid_mask.any() else entropy
             
             # Compute current ratio with curriculum
             if self.warmup_steps <= 0:
@@ -133,7 +145,7 @@ class CGGRLoss(nn.Module):
                 current_ratio = base_ratio
             elif self.dynamic_threshold:
                 current_ratio = compute_dynamic_threshold(
-                    confidence, base_ratio, self.threshold_sensitivity
+                    confidence.view(-1), base_ratio, self.threshold_sensitivity
                 )
             else:
                 current_ratio = base_ratio
@@ -160,21 +172,36 @@ class CGGRLoss(nn.Module):
         if tokens_selected > 0:
             selected_logits = logits_flat[selected_indices]
             selected_targets = targets_flat[selected_indices]
-            loss = self.base_loss(selected_logits, selected_targets).mean()
+            per_token_loss = self.base_loss(selected_logits, selected_targets)
+            # Only average over non-padding selected tokens
+            valid_loss_mask = selected_targets != self.ignore_index
+            if valid_loss_mask.any():
+                loss = per_token_loss[valid_loss_mask].mean()
+            else:
+                loss = per_token_loss.mean()
         else:
             # Fallback: if no tokens selected, use full loss
-            loss = self.base_loss(logits_flat, targets_flat).mean()
+            per_token_loss = self.base_loss(logits_flat, targets_flat)
+            valid_loss_mask = targets_flat != self.ignore_index
+            if valid_loss_mask.any():
+                loss = per_token_loss[valid_loss_mask].mean()
+            else:
+                loss = per_token_loss.mean()
             tokens_selected = num_tokens
         
-        # Metrics
+        # Metrics (use all valid tokens for confidence/entropy averages)
+        conf_for_metrics = confidence if not valid_mask.all() else confidence
+        entr_for_metrics = entropy if not valid_mask.all() else entropy
+        diff_for_metrics = difficulty[valid_mask] if not valid_mask.all() else difficulty
         self.metrics = {
             'step': self.step_count.item(),
             'token_ratio': current_ratio,
             'tokens_selected': int(tokens_selected),
-            'tokens_total': num_tokens,
-            'avg_confidence': confidence.mean().item(),
-            'avg_entropy': entropy.mean().item(),
-            'avg_difficulty': difficulty.mean().item(),
+            'tokens_total': int(valid_mask.sum().item()),
+            'avg_confidence': conf_for_metrics.mean().item(),
+            'avg_entropy': entr_for_metrics.mean().item(),
+            'avg_difficulty': diff_for_metrics[diff_for_metrics != float('-inf')].mean().item()
+                if (diff_for_metrics != float('-inf')).any() else 0.0,
             'selection': self.selection,
             'scoring': self.scoring,
         }
@@ -369,6 +396,7 @@ class CGGRScorer(nn.Module):
         dynamic_threshold: bool = True,
         threshold_sensitivity: float = 0.5,
         selection: Literal['topk', 'stratified', 'sequence_aware', 'fixed_quota'] = 'topk',
+        scoring: Literal['entropy', 'margin', 'loss', 'combined'] = 'combined',
     ):
         super().__init__()
         self.router = router
@@ -377,6 +405,7 @@ class CGGRScorer(nn.Module):
         self.dynamic_threshold = dynamic_threshold
         self.threshold_sensitivity = threshold_sensitivity
         self.selection = selection
+        self.scoring = scoring
         
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
 
@@ -403,7 +432,7 @@ class CGGRScorer(nn.Module):
             # Compute difficulty
             difficulty, confidence, entropy = fused_difficulty_score(
                 logits,
-                mode=self.scoring if hasattr(self, 'scoring') else 'combined'
+                mode=self.scoring
             )
             
             # Curriculum
@@ -414,7 +443,7 @@ class CGGRScorer(nn.Module):
             base_ratio = 1.0 - progress * (1.0 - self.min_tokens_ratio)
             
             # Dynamic threshold
-            if hasattr(self, 'selection') and self.selection == 'fixed_quota':
+            if self.selection == 'fixed_quota':
                  current_ratio = base_ratio
             elif self.dynamic_threshold:
                 current_ratio = compute_dynamic_threshold(
@@ -452,6 +481,7 @@ class CGGRModel(nn.Module):
         dynamic_threshold: bool = True,
         threshold_sensitivity: float = 0.5,
         selection: Literal['topk', 'stratified', 'sequence_aware', 'fixed_quota'] = 'topk',
+        scoring: Literal['entropy', 'margin', 'loss', 'combined'] = 'combined',
     ):
         super().__init__()
         self.model = model
@@ -464,7 +494,8 @@ class CGGRModel(nn.Module):
             warmup_steps=warmup_steps,
             dynamic_threshold=dynamic_threshold,
             threshold_sensitivity=threshold_sensitivity,
-            selection=selection
+            selection=selection,
+            scoring=scoring,
         )
         self.metrics = {}
     
@@ -491,15 +522,26 @@ class CGGRModel(nn.Module):
         
         # PASS 2: Main model forward
         if tokens_selected > 0:
-            # Batch Splitting Logic (same as before)
-            seq_difficulty = difficulty.view(batch_size, seq_len).mean(dim=-1)
+            # Batch Splitting Logic
+            # Use attention_mask to exclude padding when computing per-sequence difficulty
+            attention_mask = kwargs.get('attention_mask')
+            diff_2d = difficulty.view(batch_size, seq_len)
+            if attention_mask is not None:
+                attn_2d = attention_mask.view(batch_size, seq_len).float()
+                seq_difficulty = (diff_2d * attn_2d).sum(dim=-1) / (attn_2d.sum(dim=-1) + 1e-8)
+            else:
+                seq_difficulty = diff_2d.mean(dim=-1)
             k = max(1, int(batch_size * current_ratio))
             _, hard_seq_indices = torch.topk(seq_difficulty, k)
             
             hard_input_ids = input_ids[hard_seq_indices]
             hard_labels = labels[hard_seq_indices]
+            hard_kwargs = {
+                key: val[hard_seq_indices] if isinstance(val, torch.Tensor) and val.shape[0] == batch_size else val
+                for key, val in kwargs.items()
+            }
             
-            hard_outputs = self.model(hard_input_ids, **kwargs)
+            hard_outputs = self.model(hard_input_ids, **hard_kwargs)
             if hasattr(hard_outputs, 'logits'):
                 hard_logits = hard_outputs.logits
             else:
@@ -508,7 +550,7 @@ class CGGRModel(nn.Module):
             hard_logits_flat = hard_logits[:, :-1, :].contiguous().view(-1, hard_logits.shape[-1])
             hard_labels_flat = hard_labels[:, 1:].contiguous().view(-1)
             
-            loss = F.cross_entropy(hard_logits_flat, hard_labels_flat)
+            loss = F.cross_entropy(hard_logits_flat, hard_labels_flat, ignore_index=-100)
             
             tokens_selected = hard_seq_indices.numel() * (seq_len - 1)
         else:
@@ -521,7 +563,7 @@ class CGGRModel(nn.Module):
             
             logits_flat = logits[:, :-1, :].contiguous().view(-1, logits.shape[-1])
             labels_flat = labels[:, 1:].contiguous().view(-1)
-            loss = F.cross_entropy(logits_flat, labels_flat)
+            loss = F.cross_entropy(logits_flat, labels_flat, ignore_index=-100)
             tokens_selected = tokens_total
         
         self.metrics = {

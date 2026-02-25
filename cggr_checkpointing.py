@@ -211,20 +211,31 @@ class CGGRCheckpointedModel(nn.Module):
         current_ratio = info['current_ratio']
         
         # Select hard sequences
-        seq_difficulty = difficulty.view(batch_size, seq_len).mean(dim=-1)
+        # Use attention_mask to exclude padding tokens when computing sequence difficulty
+        attention_mask = kwargs.get('attention_mask')
+        diff_2d = difficulty.view(batch_size, seq_len)
+        if attention_mask is not None:
+            attn_2d = attention_mask.view(batch_size, seq_len).float()
+            seq_difficulty = (diff_2d * attn_2d).sum(dim=-1) / (attn_2d.sum(dim=-1) + 1e-8)
+        else:
+            seq_difficulty = diff_2d.mean(dim=-1)
         k = max(1, int(batch_size * current_ratio))
         _, hard_seq_indices = torch.topk(seq_difficulty, k)
         
         # PASS 2: Forward with selective checkpointing
         hard_input_ids = input_ids[hard_seq_indices]
         hard_labels = labels[hard_seq_indices]
+        hard_kwargs = {
+            key: val[hard_seq_indices] if isinstance(val, torch.Tensor) and val.shape[0] == batch_size else val
+            for key, val in kwargs.items()
+        }
         
         if self.use_checkpointing:
             # Enable checkpointing only for this forward pass
             if hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
         
-        hard_outputs = self.model(hard_input_ids, **kwargs)
+        hard_outputs = self.model(hard_input_ids, **hard_kwargs)
         
         if self.use_checkpointing:
             if hasattr(self.model, 'gradient_checkpointing_disable'):
@@ -238,7 +249,7 @@ class CGGRCheckpointedModel(nn.Module):
         
         shift_logits = hard_logits[:, :-1, :].contiguous().view(-1, hard_logits.shape[-1])
         shift_labels = hard_labels[:, 1:].contiguous().view(-1)
-        loss = nn.functional.cross_entropy(shift_logits, shift_labels)
+        loss = nn.functional.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
         
         # Metrics
         self.metrics = {
