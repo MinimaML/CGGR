@@ -1,3 +1,11 @@
+"""
+Experimental race script.
+
+This script is retained for long-running competitive training experiments. It is
+not part of the canonical benchmark surface and should not be treated as a
+hardened evaluation protocol.
+"""
+
 # --- EXTERNAL SCRIPT FOR CLEAN MEMORY ---
 import time
 import math
@@ -19,7 +27,7 @@ import wandb
 
 # --- ⚙️ CONFIG ---
 class RaceConfig:
-    PROJECT_NAME = "cggr-vs-standard-race"
+    PROJECT_NAME = "cggr-vs-standard-experimental-race"
     RUN_DURATION_HOURS = 1.5
     SEED = 42
     ORG_NAME = "MinimaML"
@@ -235,7 +243,7 @@ if __name__ == '__main__':
     mode, dry_run = args.mode, args.dry_run
     set_seed(config.SEED)
     
-    run_name = f"{config.PROJECT_NAME}_{mode}_robust"
+    run_name = f"{config.PROJECT_NAME}_{mode}"
     bs = config.BS_CGGR if mode == "cggr" else config.BS_BASELINE
     
     wandb.init(project=config.PROJECT_NAME, name=run_name, config={"mode": mode, "bs": bs})

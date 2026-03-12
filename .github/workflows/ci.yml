@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .[dev]
+
+      - name: Compile Python Files
+        run: python -m compileall -q cggr.py benchmarks scripts tests setup.py
+
+      - name: Run Unit Tests
+        run: pytest -q
+
+      - name: Canonical CLI Smoke
+        run: |
+          python benchmarks/canonical_benchmark.py --help
+          python benchmarks/canonical_quality_benchmark.py --help
+
+  benchmark-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install benchmark dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .[benchmark]
+
+      - name: Canonical Throughput Smoke (CPU)
+        run: |
+          python benchmarks/canonical_benchmark.py \
+            --device cpu \
+            --model sshleifer/tiny-gpt2 \
+            --batch-sizes 1 \
+            --seq-len 32 \
+            --warmup-runs 1 \
+            --timed-runs 1 \
+            --artifact-tag ci-smoke-throughput \
+            --benchmark-tier ci-smoke \
+            --output benchmark_results/ci_smoke_throughput.json
+
+      - name: Canonical Quality Smoke (CPU)
+        run: |
+          python benchmarks/canonical_quality_benchmark.py \
+            --device cpu \
+            --model sshleifer/tiny-gpt2 \
+            --dataset wikitext \
+            --dataset-config wikitext-2-raw-v1 \
+            --seq-len 32 \
+            --batch-size 2 \
+            --train-steps 1 \
+            --eval-batches 1 \
+            --ratio 0.25 \
+            --max-train-texts 40 \
+            --max-eval-texts 20 \
+            --artifact-tag ci-smoke-quality \
+            --benchmark-tier ci-smoke \
+            --output benchmark_results/ci_smoke_quality.json
+
+      - name: Verify Smoke Artifacts
+        run: |
+          test -f benchmark_results/ci_smoke_throughput.json
+          test -f benchmark_results/ci_smoke_quality.json
+
+  package:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build Package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build
+
+      - name: Install Built Wheel
+        run: |
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          import cggr
+          print("cggr import ok")
+          print("exports:", sorted(cggr.__all__)[:5])
+          PY

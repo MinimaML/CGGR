@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-CGGR Benchmark Suite v2
-=======================
-Professional benchmarking with CLI, modular tests, and rich outputs.
+Experimental CGGR benchmark suite v2.
+
+This script is retained for research iteration. It is not part of the
+canonical benchmark surface, and its synthetic convergence path should be
+treated as a smoke test rather than a publishable quality benchmark.
 
 Usage:
     python benchmark_v2.py --model HuggingFaceTB/SmolLM-135M --all
@@ -326,8 +328,8 @@ class Benchmarker:
         return best
     
     def benchmark_quality(self) -> List[QualityResult]:
-        """Run quality benchmarks (convergence)."""
-        console.print("\n[bold magenta]QUALITY BENCHMARK (Convergence)[/bold magenta]")
+        """Run synthetic convergence smoke tests."""
+        console.print("\n[bold magenta]SYNTHETIC CONVERGENCE SMOKE TEST[/bold magenta]")
         results = []
         
         bs = self.config.batch_sizes[0]  # Use smallest batch
