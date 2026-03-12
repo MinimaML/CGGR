@@ -1,0 +1,127 @@
+{
+  "timestamp": "2026-03-12T10:28:34.292581Z",
+  "git_commit": "unknown",
+  "artifact": {
+    "tag": "cuda_single_l40s_smollm360_ratio060_v2_throughput",
+    "tier": "cuda-canonical",
+    "device_type": "cuda",
+    "require_cuda": true
+  },
+  "platform": {
+    "hostname": "j20n2.mgt.liza.surf.nl",
+    "python": "3.11.2",
+    "system": "Linux-6.1.0-43-amd64-x86_64-with-glibc2.36",
+    "torch": "2.10.0+cu128",
+    "device_type": "cuda",
+    "cuda_available": true,
+    "mps_available": false,
+    "cuda_visible_devices": "0",
+    "visible_gpu_count": 1,
+    "gpu_name": "NVIDIA L40S",
+    "visible_gpu_names": [
+      "NVIDIA L40S"
+    ],
+    "visible_gpu_total_memory_mb": [
+      45459.5
+    ],
+    "cuda_runtime_version": "12.8",
+    "cudnn_version": 91002
+  },
+  "config": {
+    "model_name": "HuggingFaceTB/SmolLM-360M",
+    "batch_sizes": [
+      4,
+      8,
+      16
+    ],
+    "seq_len": 512,
+    "cggr_ratio": 0.6,
+    "warmup_runs": 5,
+    "timed_runs": 25,
+    "seed": 42,
+    "device": "cuda",
+    "require_cuda": true,
+    "artifact_tag": "cuda_single_l40s_smollm360_ratio060_v2_throughput",
+    "benchmark_tier": "cuda-canonical",
+    "output": "benchmark_results/cuda_single_l40s_smollm360_ratio060_v2_throughput.json"
+  },
+  "results": [
+    {
+      "name": "standard",
+      "batch_size": 4,
+      "tokens_per_second": 16030.320303639526,
+      "steps_per_second": 7.827304835761487,
+      "mean_latency_ms": 126.42224049195647,
+      "peak_memory_mb": 9482.326171875
+    },
+    {
+      "name": "random_sequence",
+      "batch_size": 4,
+      "tokens_per_second": 28004.08812461821,
+      "steps_per_second": 13.673871154598736,
+      "mean_latency_ms": 71.62844180129468,
+      "peak_memory_mb": 5512.7138671875
+    },
+    {
+      "name": "cggr",
+      "batch_size": 4,
+      "tokens_per_second": 18960.289013255657,
+      "steps_per_second": 9.257953619753739,
+      "mean_latency_ms": 106.58183934167027,
+      "peak_memory_mb": 7620.52001953125
+    },
+    {
+      "name": "standard",
+      "batch_size": 8,
+      "tokens_per_second": 13948.16068844448,
+      "steps_per_second": 3.4053126680772654,
+      "mean_latency_ms": 292.34417381696403,
+      "peak_memory_mb": 17748.365234375
+    },
+    {
+      "name": "random_sequence",
+      "batch_size": 8,
+      "tokens_per_second": 31195.859104716837,
+      "steps_per_second": 7.616176539237509,
+      "mean_latency_ms": 129.98435004614294,
+      "peak_memory_mb": 9681.0146484375
+    },
+    {
+      "name": "cggr",
+      "batch_size": 8,
+      "tokens_per_second": 20575.4111692334,
+      "steps_per_second": 5.023293742488623,
+      "mean_latency_ms": 197.72756793536246,
+      "peak_memory_mb": 11750.20556640625
+    },
+    {
+      "name": "standard",
+      "batch_size": 16,
+      "tokens_per_second": 12687.853959619195,
+      "steps_per_second": 1.5488102978050775,
+      "mean_latency_ms": 644.825261393562,
+      "peak_memory_mb": 33621.443359375
+    },
+    {
+      "name": "random_sequence",
+      "batch_size": 16,
+      "tokens_per_second": 23539.909481937626,
+      "steps_per_second": 2.873524106681839,
+      "mean_latency_ms": 347.2233931347728,
+      "peak_memory_mb": 19976.2509765625
+    },
+    {
+      "name": "cggr",
+      "batch_size": 16,
+      "tokens_per_second": 18808.429770778363,
+      "steps_per_second": 2.295950899753218,
+      "mean_latency_ms": 434.75248673930764,
+      "peak_memory_mb": 21947.43408203125
+    }
+  ],
+  "notes": [
+    "Synthetic token inputs only. This benchmark is for throughput/memory, not quality.",
+    "Random-sequence baseline is included to avoid comparing CGGR only against full-loss training.",
+    "Use --require-cuda for research-grade CUDA runs when local smoke fallback would be misleading."
+  ]
+}

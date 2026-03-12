@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Extended Math Fine-tune Benchmark
-=================================
-Compare Standard vs CGGR fine-tuning on GSM8K over extended training runs.
+Experimental math fine-tune benchmark.
+
+This script is retained for research iteration on math datasets. It is not part
+of the canonical benchmark surface, and its outputs should be treated as
+experimental training results rather than hardened evidence.
 
 Usage:
     python math_finetune_benchmark.py --all --hours 6          # Run both automatically
@@ -380,7 +382,7 @@ def run_training(
             if eval_result["accuracy"] > state.best_accuracy:
                 state.best_accuracy = eval_result["accuracy"]
             
-            console.print(f"[bold green]GSM8K Accuracy: {eval_result['accuracy']:.2%} (Best: {state.best_accuracy:.2%})[/bold green]")
+            console.print(f"[bold green]Observed GSM8K accuracy for this run: {eval_result['accuracy']:.2%} (Best: {state.best_accuracy:.2%})[/bold green]")
             
             if use_wandb and HAS_WANDB:
                 wandb.log({"gsm8k_accuracy": eval_result["accuracy"], "best_accuracy": state.best_accuracy})
@@ -420,7 +422,7 @@ def run_training(
         wandb.log({"final_accuracy": final_eval["accuracy"]})
         wandb.finish()
     
-    console.print(f"\n[bold green]COMPLETE: {mode.upper()} - Final Accuracy: {final_eval['accuracy']:.2%}[/bold green]")
+    console.print(f"\n[bold green]RUN COMPLETE: {mode.upper()} - Final observed accuracy: {final_eval['accuracy']:.2%}[/bold green]")
     
     # Cleanup
     del model, base_model, optimizer

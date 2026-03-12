@@ -1,8 +1,9 @@
 """
-CGGR Refined Benchmark Suite
-============================
-High-precision measurements of throughput, VRAM, convergence, and QUALITY.
-Includes PPL evaluation on WikiText-2 and loss curve visualization.
+Experimental CGGR benchmark suite.
+
+This script remains useful for research iteration, but it is not part of the
+canonical benchmark surface. Some of its measurements are proxy metrics and
+should not be cited as headline evidence without independent hardening.
 """
 
 import torch
@@ -77,10 +78,10 @@ def generate_report(results: List[BenchmarkResult], hard_token_metrics: Dict[str
 **GPU:** {gpu_name} ({vram_total:.1f} GB)
 **Model:** HuggingFaceTB/SmolLM-135M
 
-## 1. Executive Summary
+## 1. Exploratory Summary
 - **Throughput Speedup:** **{speedup:.2f}x** ({(cggr_peak.tps if cggr_peak else 0):.0f} vs {(std_peak.tps if std_peak else 0):.0f} TPS)
 - **VRAM Capacity Gain:** **{bs_cggr/bs_std:.1f}x** Batch Size ({bs_cggr} vs {bs_std})
-- **Quality Status:** Stable Convergence Verified
+- **Quality Status:** Exploratory proxy only
 
 ## 2. Detailed Metrics
 
@@ -92,13 +93,13 @@ def generate_report(results: List[BenchmarkResult], hard_token_metrics: Dict[str
 
 **Efficiency Note:** CGGR achieves {speedup:.2f}x throughput by leveraging sparse gradient routing to fit larger batches.
 
-### 🎯 Accuracy (Hardest 25% Tokens)
+### 🎯 Hard-Token Loss Proxy
 | Metric | Standard (Baseline) | CGGR (Selective) | Delta |
 | :--- | :--- | :--- | :--- |
 | **Hard Token Loss** | {hard_token_metrics.get('std_hard', 0):.4f} | {hard_token_metrics.get('cggr_hard', 0):.4f} | {abs(hard_token_metrics.get('std_hard', 0) - hard_token_metrics.get('cggr_hard', 0)):.4f} |
 
-### 📉 Convergence (FineWeb-Edu)
-Training stability verified over 50 steps.
+### 📉 Convergence Proxy (FineWeb-Edu)
+Observed over a short exploratory run.
 - **Standard Final Loss:** {(std_conv.final_loss if std_conv else 0):.4f}
 - **CGGR Final Loss:** {(cggr_conv.final_loss if cggr_conv else 0):.4f}
 
@@ -326,7 +327,7 @@ def benchmark_hard_token_loss(model_std, model_cggr, preloaded_data, num_batches
     return total_std_loss / tokens_count, total_cggr_loss / tokens_count
 
 def main():
-    console.print(Panel("[bold cyan]CGGR REFINED BENCHMARK SUITE[/bold cyan]"))
+    console.print(Panel("[bold cyan]CGGR EXPERIMENTAL BENCHMARK SUITE[/bold cyan]"))
     
     model_name = "HuggingFaceTB/SmolLM-135M"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -419,9 +420,9 @@ def main():
     
     # Performance Insight
     if abs(std_hard_loss - cggr_hard_loss) < 0.1:
-        console.print("[bold green]✓ SUCCESS: CGGR matches Standard accuracy on the hardest 25% of tokens.[/bold green]")
+        console.print("[bold green]Observed near-match on the hard-token proxy for this run.[/bold green]")
     else:
-        console.print("[yellow]! NOTE: Accuracy delta observed. Check routing thresholds.[/yellow]")
+        console.print("[yellow]Observed a delta on the hard-token proxy for this run.[/yellow]")
 
     # Clean up results
     del model_std, model_cggr
@@ -497,7 +498,7 @@ def main():
     
     # Plain text summary for easier viewing
     print("\n" + "="*70)
-    print("BENCHMARK COMPLETE - PLAIN TEXT SUMMARY")
+    print("EXPERIMENTAL BENCHMARK SUMMARY")
     print("="*70)
     for r in results:
         speedup = r.tps / baseline.tps
@@ -513,9 +514,9 @@ def main():
     if std_conv.final_loss > 0 and cggr_conv.final_loss > 0:
         loss_diff = abs(cggr_conv.final_loss - std_conv.final_loss) / std_conv.final_loss * 100
         if loss_diff < 20:
-            print("\n✓ QUALITY CHECK PASSED: CGGR loss within 20% of Standard")
+            print("\nExploratory note: CGGR loss stayed within 20% of Standard in this run.")
         else:
-            print(f"\n⚠ QUALITY CHECK: CGGR loss differs by {loss_diff:.1f}% from Standard")
+            print(f"\nExploratory note: CGGR loss differed by {loss_diff:.1f}% from Standard in this run.")
 
     # Save to JSON
     import json
@@ -529,4 +530,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
