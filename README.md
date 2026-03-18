@@ -1,9 +1,38 @@
 # CGGR - Confidence-Gated Gradient Routing
 
 > [!WARNING]
-> This is highly experimental, and prepare for the worst hope for the best.
+> CGGR is still experimental. The core selective-loss path is usable for research and prototyping, but large parts of the repo remain exploratory.
 
-Selective loss computation for Transformer training. Only hard tokens contribute to loss, providing actual backward pass savings.
+Selective loss computation for Transformer-style training. The core idea is to score examples by difficulty, then spend backward-pass work on the hardest part of the batch.
+
+## Status
+
+### Stable Core
+
+The most credible, currently maintained surface is:
+
+- `CGGRLoss`
+- `CGGRModel`
+- `CGGRScorer`
+- `create_truncated_router`
+- PyTorch fallback kernels in `triton_kernels.py`
+
+### Experimental / Best-Effort
+
+The following modules exist, but should be treated as research code rather than stable product surface:
+
+- `cggr_async.py`
+- `cggr_checkpointing.py`
+- `cggr_dataloader.py`
+- `cggr_flash.py`
+- `persistent_cggr_kernels.py`
+- benchmark and race scripts under `benchmarks/`
+
+### Current Behavior Notes
+
+- `CGGRLoss` selects tokens for loss computation.
+- `CGGRModel` currently scores token difficulty but performs its second training pass on the hardest sequences, not arbitrary token slices.
+- Architecture auto-detection works best on common Hugging Face causal LM layouts. Non-causal and less common architectures should be treated as best-effort until they are covered by dedicated tests.
 
 ## Installation
 
@@ -11,7 +40,7 @@ Selective loss computation for Transformer training. Only hard tokens contribute
 pip install cggr
 ```
 
-For CUDA acceleration with Triton kernels (Linux/Windows):
+For optional CUDA acceleration with Triton kernels:
 
 ```bash
 pip install cggr[cuda]
@@ -19,30 +48,29 @@ pip install cggr[cuda]
 
 ## Platform Compatibility
 
-| Platform            | Triton Kernels | PyTorch Fallback |    Status    |
-| ------------------- | :------------: | :--------------: | :----------: |
-| CUDA (Linux)        |       ✓        |        ✓         | Full Support |
-| CUDA (Windows)      |       ✓        |        ✓         | Full Support |
-| ROCm (AMD)          |       ✗        |        ✓         |  Supported   |
-| MPS (Apple Silicon) |       ✗        |        ✓         |  Supported   |
-| CPU                 |       ✗        |        ✓         |  Supported   |
+| Platform            | Triton Kernels | PyTorch Fallback | Status |
+| ------------------- | :------------: | :--------------: | ------ |
+| CUDA (Linux)        |       ✓        |        ✓         | Best-supported path |
+| CUDA (Windows)      |       ✓        |        ✓         | Best-effort |
+| ROCm (AMD)          |       ✗        |        ✓         | Fallback-only |
+| MPS (Apple Silicon) |       ✗        |        ✓         | Fallback-only |
+| CPU                 |       ✗        |        ✓         | Fallback-only |
 
 ## Model Architecture Support
 
-| Architecture                   | Auto-Detect | Notes                     |
-| ------------------------------ | :---------: | ------------------------- |
-| Llama/Mistral/Qwen/Gemma/Phi-3 |      ✓      | `model.layers` style      |
-| GPT-2/GPT-J/Falcon/GPT-NeoX    |      ✓      | `transformer.h` style     |
-| BERT/RoBERTa                   |      ✓      | `encoder.layer` style     |
-| Mamba/SSM                      |      ✓      | `backbone.layers` style   |
-| Other                          | Passthrough | Uses full model as router |
+| Architecture                   | Auto-Detect | Notes |
+| ------------------------------ | :---------: | ----- |
+| Llama/Mistral/Qwen/Gemma/Phi-3 |      ✓      | Primary target, `model.layers` style |
+| GPT-2/GPT-J/Falcon/GPT-NeoX    |      ✓      | Implemented, `transformer.h` style |
+| BERT/RoBERTa                   | Best-effort | Not yet covered by dedicated tests |
+| Mamba/SSM                      | Best-effort | Not yet covered by dedicated tests |
+| Other                          | Passthrough | Uses full model as router, usually slower |
 
-## Flash Attention Support
+## Flash Attention Utilities
 
-CGGR supports Flash Attention for memory-efficient attention computation:
+The repo includes experimental helpers for enabling Flash Attention / SDPA on Hugging Face models:
 
 ```bash
-# Install with Flash Attention support
 pip install cggr[flash]
 ```
 
@@ -58,52 +86,53 @@ model = AutoModelForCausalLM.from_pretrained("...")
 model = enable_flash_attention(model)  # Auto-selects best backend
 ```
 
-| Backend             | Requirements       | Speed    |
-| ------------------- | ------------------ | -------- |
-| `flash_attention_2` | flash-attn library | Fastest  |
-| `sdpa`              | PyTorch 2.0+       | Fast     |
+| Backend             | Requirements       | Notes |
+| ------------------- | ------------------ | ----- |
+| `flash_attention_2` | flash-attn library | Experimental helper path |
+| `sdpa`              | PyTorch 2.0+       | Experimental helper path |
 | `eager`             | None               | Baseline |
 
-## Why CGGR?
+## What CGGR Tries To Improve
 
-| Metric              | Standard Training      | CGGR (Batch Split)      | Benefit                           |
-| :------------------ | :--------------------- | :---------------------- | :-------------------------------- |
-| **Backward Pass**   | 100% of tokens         | 25% of tokens           | 4x cheaper backward pass          |
-| **Forward Pass**    | 1.0x cost              | ~1.1x cost (Pass 1 + 2) | Negligible overhead (~9ms)        |
-| **Total Speed**     | 1.0x (Baseline)        | 1.4x - 2.0x faster      | Significant training acceleration |
-| **Data Efficiency** | Learns from all tokens | Prioritizes hard tokens | Learns faster from hard examples  |
-| **Memory**          | High (full graph)      | Lower (sparse graph)    | Can increase batch size           |
+| Metric            | Standard Training | CGGR Goal | Caveat |
+| :---------------- | :---------------- | :-------- | :----- |
+| Backward compute  | Full batch/tokens | Selective loss on hardest part of batch | Savings depend on wrapper and routing ratio |
+| Forward overhead  | Single pass       | Router pass + selective main pass | Can erase gains on some models/hardware |
+| Memory use        | Full graph        | Smaller active backward graph | Most visible with `CGGRModel` |
+| Throughput        | Baseline          | Potential improvement | Must be benchmarked per setup |
+| Quality           | Baseline          | Similar or better with good routing | Not yet established as a universal result |
 
-## Benchmark Race Results (2026)
+## Benchmark Status
 
-**Model:** HuggingFaceTB/SmolLM-135M  
-**Dataset:** AI-MO/NuminaMath-1.5  
-**Evaluation:** GSM8K (Math Reasoning)  
+Checked-in benchmark artifacts are exploratory, not canonical proof of the method. They are useful for local investigation, but they should not be read as a production benchmark suite yet.
 
-> [!IMPORTANT]
-> **Key Result:** CGGR achieved 4x higher sample throughput and +1.5% Accuracy by utilizing idle compute cycles.
+The current repository contains:
 
-| Metric                      | Standard (BS=1) | CGGR (BS=4) | Improvement |
-| :-------------------------- | :-------------- | :---------- | :---------- |
-| **Final Accuracy (GSM8K)**  | 8.00%           | **9.50%**   | **+1.50%**  |
-| **Final Loss**              | 0.3610          | **0.0980**  | **-73%**    |
-| **Total Samples Processed** | ~14,368         | ~58,716     | **4.08x**   |
-| **Wall Clock Time**         | 6 Hours         | 6 Hours     | Same        |
+- one canonical synthetic throughput/memory entry point: `benchmarks/canonical_benchmark.py`
+- one canonical dataset-backed quality entry point: `benchmarks/canonical_quality_benchmark.py`
+- one reusable single-GPU CUDA wrapper: `scripts/run_canonical_l40s.sh`
+- additional exploratory benchmark scripts under `benchmarks/`
+- one checked-in benchmark report under `benchmark_results/`
+- early experiments across throughput, memory, and convergence behavior
 
-### The "Free Lunch" Phenomenon
-In standard training (Batch Size = 1), high-end GPUs are often latency-bound, spending more time waiting for memory transfers than doing math. 
+Phase 0 hardening rule: treat benchmark claims as setup-specific unless they are backed by a reproducible command, fixed config, and matching artifact in the repo.
 
-CGGR exploits this by quadrupling the batch size (Batch Size = 4) without increasing the step time.
-*   **Step Latency:** Unchanged (1.02x throughput ratio in steps/sec).
-*   **Data Throughput:** 4.08x higher (samples/sec).
+Current hardening benchmark convention:
 
-By processing 4x more data in the same timeframe, CGGR converges significantly faster and deeper (Loss 0.09 vs 0.36).
+- local MPS/CPU outputs are pipeline-validation artifacts only
+- CUDA outputs with explicit artifact tags are the canonical evidence path for this repo
+- dataset-backed canonical quality runs need meaningful host RAM in Slurm (`--mem=16G` minimum, `--mem=32G` recommended)
+
+See `benchmarks/README.md` for the canonical vs experimental split.
+The latest checked-in single-L40S canonical interpretation is in `benchmark_results/cuda_single_l40s_smollm135_summary.md`.
+Release gating checklist is in `RELEASE_CHECKLIST.md`.
+Compatibility policy is in `COMPATIBILITY.md`.
 
 ## Quick Start
 
-### 1. Batch Splitting (Recommended)
+### 1. Batch Splitting (Recommended Core Path)
 
-The most efficient way to use CGGR is via `CGGRModel`. It uses a lightweight router to score difficulty and only computes gradients for hard tokens.
+The main end-to-end wrapper is `CGGRModel`. It uses a lightweight router to score difficulty, then trains on the hardest sequences in the batch.
 
 ```python
 from cggr import CGGRModel, create_truncated_router
@@ -173,8 +202,8 @@ expert_output = expert_layer(x) * mask.unsqueeze(-1)
 | ---------- | ------------------------- | ------------------- |
 | `entropy`  | High entropy = hard       | General training    |
 | `margin`   | Small top-2 margin = hard | Classification      |
-| `loss`     | High loss = hard          | Direct optimization |
-| `combined` | All signals combined      | Best overall        |
+| `loss`     | Intended to use per-token loss | Experimental semantics |
+| `combined` | Mix of uncertainty signals | Default research setting |
 
 ## Selection Strategies
 
@@ -216,16 +245,21 @@ CGGRLoss(
 )
 ```
 
-## Performance
+## Performance Notes
 
-| Config                | Backward FLOPs | Overhead |
-| --------------------- | -------------- | -------- |
-| Standard Loss         | 100%           | 0%       |
-| **CGGR (25% tokens)** | **~25%**       | **~0%**  |
+For `CGGRLoss`, selective loss reduces how many tokens contribute to the final loss tensor, but it does not automatically guarantee end-to-end wall-clock speedup.
 
-## Persistent CGGR Kernels (Advanced)
+For `CGGRModel`, the intended win comes from training the main model on a smaller subset of the batch after a router pass. Whether that produces a net gain depends on:
 
-For Token-Routed MLP and Mixture-of-Experts architectures, CGGR provides advanced persistent kernels with:
+- model architecture
+- batch shape
+- routing ratio
+- GPU characteristics
+- router cost vs main-model savings
+
+## Persistent CGGR Kernels (Advanced, Experimental)
+
+For Token-Routed MLP and Mixture-of-Experts architectures, the repo includes experimental persistent-kernel work:
 
 1. **Persistent Kernels** - Keep SM threads active across expert batches
 2. **Cooperative Thread Groups** - Better SM utilization through cooperative scheduling
@@ -248,10 +282,4 @@ output, aux_loss = moe_layer(hidden_states)
 total_loss = language_modeling_loss + 0.01 * aux_loss
 ```
 
-**Expected Performance Improvement:** ~10-15% faster than standard grouped GEMM
-
-| Metric                 | Standard   | Persistent   | Improvement |
-| ---------------------- | ---------- | ------------ | ----------- |
-| Kernel Launch Overhead | ~5μs/batch | ~0.5μs/batch | ~10x        |
-| SM Utilization         | ~70%       | ~85%         | ~21%        |
-| End-to-End Throughput  | Baseline   | +10-15%      | ✓           |
+This code path is source-tree experimental work. It is not part of the stable Phase 0 surface and should be validated independently before use.

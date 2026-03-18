@@ -8,7 +8,7 @@ Supports CPU, CUDA, and MPS devices.
 import pytest
 import torch
 import torch.nn as nn
-from cggr import CGGRLoss, CGGRModel
+from cggr import CGGRLoss, CGGRModel, CGGRScorer, create_truncated_router
 
 
 # =============================================================================
@@ -394,6 +394,370 @@ class TestPyTorchFallback:
         assert mask.shape == difficulty.shape
         # Should select some tokens (not exact due to rounding)
         assert mask.sum() > 0
+
+
+# =============================================================================
+# Wrapper-Level Tests
+# =============================================================================
+
+class MockCausalBase(nn.Module):
+    def __init__(self, config=None, vocab_size=64, hidden_size=32, num_layers=2):
+        super().__init__()
+        if config is not None and not isinstance(config, int):
+            vocab_size = getattr(config, 'vocab_size', vocab_size)
+            hidden_size = getattr(config, 'hidden_size', hidden_size)
+            num_layers = getattr(config, 'num_hidden_layers', num_layers)
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.layers = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, input_ids, **kwargs):
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = torch.tanh(layer(x))
+        return self.norm(x)
+
+
+class MockCausalLM(nn.Module):
+    def __init__(self, vocab_size=64, hidden_size=32, num_layers=2):
+        super().__init__()
+        self.config = type('Config', (), {
+            'vocab_size': vocab_size,
+            'hidden_size': hidden_size,
+            'num_hidden_layers': num_layers,
+        })()
+        self.model = MockCausalBase(vocab_size=vocab_size, hidden_size=hidden_size, num_layers=num_layers)
+        self.lm_head = nn.Linear(hidden_size, vocab_size)
+        self.last_input_shape = None
+
+    def forward(self, input_ids, **kwargs):
+        self.last_input_shape = tuple(input_ids.shape)
+        hidden = self.model(input_ids, **kwargs)
+        logits = self.lm_head(hidden)
+        return type('Output', (), {'logits': logits})()
+
+
+class MockBertEncoder(nn.Module):
+    def __init__(self, hidden_size=32, num_layers=2):
+        super().__init__()
+        self.layer = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)
+        ])
+
+    def forward(self, hidden_states):
+        x = hidden_states
+        for layer in self.layer:
+            x = torch.relu(layer(x))
+        return x
+
+
+class MockBertBackbone(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.encoder = MockBertEncoder(
+            hidden_size=config.hidden_size,
+            num_layers=config.num_hidden_layers,
+        )
+
+    def forward(self, input_ids=None, **kwargs):
+        hidden = self.embeddings(input_ids)
+        hidden = self.encoder(hidden)
+        return type('Output', (), {'last_hidden_state': hidden})()
+
+
+class MockMaskedLM(nn.Module):
+    def __init__(self, vocab_size=64, hidden_size=32, num_layers=2):
+        super().__init__()
+        self.config = type('Config', (), {
+            'vocab_size': vocab_size,
+            'hidden_size': hidden_size,
+            'num_hidden_layers': num_layers,
+        })()
+        self.bert = MockBertBackbone(self.config)
+        self.cls = type('CLS', (), {})()
+        self.cls.predictions = type('Predictions', (), {})()
+        self.cls.predictions.decoder = nn.Linear(hidden_size, vocab_size)
+
+    def get_output_embeddings(self):
+        return self.cls.predictions.decoder
+
+    def forward(self, input_ids, **kwargs):
+        outputs = self.bert(input_ids=input_ids, **kwargs)
+        logits = self.cls.predictions.decoder(outputs.last_hidden_state)
+        return type('Output', (), {'logits': logits})()
+
+
+class UnsupportedBackbone(nn.Module):
+    def __init__(self, config=None, *, vocab_size=64, hidden_size=32):
+        super().__init__()
+        if config is not None and not isinstance(config, int):
+            raise TypeError("unsupported config-only construction")
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.layers = nn.ModuleList([nn.Linear(hidden_size, hidden_size)])
+        self.norm = nn.LayerNorm(hidden_size)
+
+
+class MockFallbackRouterModel(nn.Module):
+    def __init__(self, vocab_size=64, hidden_size=32):
+        super().__init__()
+        self.config = type('Config', (), {
+            'vocab_size': vocab_size,
+            'hidden_size': hidden_size,
+            'num_hidden_layers': 2,
+        })()
+        self.model = UnsupportedBackbone(vocab_size=vocab_size, hidden_size=hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input_ids, **kwargs):
+        hidden = self.model.embed_tokens(input_ids)
+        hidden = torch.tanh(self.model.layers[0](hidden))
+        hidden = self.model.norm(hidden)
+        logits = self.lm_head(hidden)
+        return type('Output', (), {'logits': logits})()
+
+
+class RecordingScorer(nn.Module):
+    def __init__(self, difficulty, mask, info):
+        super().__init__()
+        self.difficulty = difficulty
+        self.mask = mask
+        self.info = info
+        self.last_targets = None
+        self.step_count = torch.tensor(0)
+        self.selection = info.get('selection', 'topk')
+        self.scoring = info.get('scoring', 'combined')
+
+    def step(self):
+        self.step_count += 1
+
+    def forward(self, input_ids, targets=None, **kwargs):
+        self.last_targets = targets
+        return self.difficulty, self.mask, self.info
+
+
+@pytest.fixture
+def mock_causal_model():
+    torch.manual_seed(0)
+    return MockCausalLM().to(DEVICE)
+
+
+@pytest.fixture
+def mock_masked_lm():
+    torch.manual_seed(0)
+    return MockMaskedLM().to(DEVICE)
+
+
+class TestCGGRScorer:
+    def test_sequence_aware_ensures_min_tokens_per_sequence(self, mock_causal_model):
+        scorer = CGGRScorer(
+            router=mock_causal_model,
+            selection='sequence_aware',
+            min_tokens_ratio=0.1,
+            warmup_steps=0,
+            min_tokens_per_sequence=2,
+        )
+
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (3, 7), device=DEVICE)
+        difficulty, mask, info = scorer(input_ids)
+
+        assert difficulty.shape == input_ids.shape
+        assert mask.shape == input_ids.shape
+        assert torch.all(mask.sum(dim=-1) >= 2)
+        assert info['tokens_selected'] >= 3 * 2
+
+    def test_fixed_quota_ignores_dynamic_threshold(self, mock_causal_model):
+        scorer = CGGRScorer(
+            router=mock_causal_model,
+            selection='fixed_quota',
+            min_tokens_ratio=0.4,
+            warmup_steps=0,
+            dynamic_threshold=True,
+        )
+
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (2, 10), device=DEVICE)
+        _, _, info = scorer(input_ids)
+
+        assert info['current_ratio'] == 0.4
+
+    def test_loss_scoring_uses_targets_when_provided(self, mock_causal_model):
+        scorer = CGGRScorer(
+            router=mock_causal_model,
+            scoring='loss',
+            min_tokens_ratio=0.5,
+            warmup_steps=0,
+            dynamic_threshold=False,
+        )
+
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (2, 6), device=DEVICE)
+        targets = torch.randint(0, mock_causal_model.config.vocab_size, (2, 6), device=DEVICE)
+
+        difficulty_with_targets, _, _ = scorer(input_ids, targets=targets)
+        difficulty_without_targets, _, _ = scorer(input_ids)
+
+        assert not torch.allclose(difficulty_with_targets, difficulty_without_targets)
+
+    def test_invalid_input_shape_raises(self, mock_causal_model):
+        scorer = CGGRScorer(router=mock_causal_model)
+        bad_input = torch.randint(0, mock_causal_model.config.vocab_size, (2, 3, 4), device=DEVICE)
+        with pytest.raises(ValueError, match="shape"):
+            _ = scorer(bad_input)
+
+    def test_targets_shape_mismatch_raises(self, mock_causal_model):
+        scorer = CGGRScorer(router=mock_causal_model)
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (2, 6), device=DEVICE)
+        bad_targets = torch.randint(0, mock_causal_model.config.vocab_size, (2, 5), device=DEVICE)
+        with pytest.raises(ValueError, match="must match input_ids"):
+            _ = scorer(input_ids, targets=bad_targets)
+
+
+class TestCGGRModelWrapper:
+    def test_model_routes_sequences_from_mask_not_batch_ratio(self, mock_causal_model):
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (4, 6), device=DEVICE)
+        labels = torch.randint(0, mock_causal_model.config.vocab_size, (4, 6), device=DEVICE)
+
+        difficulty = torch.zeros(4, 6, device=DEVICE)
+        mask = torch.zeros(4, 6, device=DEVICE)
+        mask[1, 2] = 1.0
+        info = {
+            'current_ratio': 0.5,
+            'confidence': torch.zeros(4, 6, device=DEVICE),
+            'entropy': torch.ones(4, 6, device=DEVICE),
+            'selection': 'topk',
+            'scoring': 'combined',
+        }
+
+        model = CGGRModel(mock_causal_model, min_tokens_ratio=0.5, warmup_steps=0)
+        model.scorer = RecordingScorer(difficulty, mask, info)
+
+        loss = model(input_ids, labels=labels)
+
+        assert torch.isfinite(loss)
+        assert mock_causal_model.last_input_shape == (1, 6)
+        metrics = model.get_metrics()
+        assert metrics['sequences_selected'] == 1
+        assert metrics['router_tokens_selected'] == 1
+        assert metrics['tokens_selected'] == 5
+        assert metrics['sequence_selection_mode'] == 'mask_any'
+
+    def test_model_passes_labels_to_scorer_targets(self, mock_causal_model):
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (2, 5), device=DEVICE)
+        labels = torch.randint(0, mock_causal_model.config.vocab_size, (2, 5), device=DEVICE)
+
+        difficulty = torch.zeros(2, 5, device=DEVICE)
+        mask = torch.ones(2, 5, device=DEVICE)
+        info = {
+            'current_ratio': 1.0,
+            'confidence': torch.zeros(2, 5, device=DEVICE),
+            'entropy': torch.ones(2, 5, device=DEVICE),
+            'selection': 'topk',
+            'scoring': 'combined',
+        }
+
+        model = CGGRModel(mock_causal_model, min_tokens_ratio=1.0, warmup_steps=0)
+        recorder = RecordingScorer(difficulty, mask, info)
+        model.scorer = recorder
+
+        _ = model(input_ids, labels=labels)
+
+        assert recorder.last_targets is labels
+
+    def test_model_quota_fallback_when_all_sequences_marked_hard(self, mock_causal_model):
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (4, 8), device=DEVICE)
+        labels = torch.randint(0, mock_causal_model.config.vocab_size, (4, 8), device=DEVICE)
+
+        difficulty = torch.tensor(
+            [
+                [1.0] * 8,
+                [0.8] * 8,
+                [0.4] * 8,
+                [0.1] * 8,
+            ],
+            device=DEVICE,
+        )
+        mask = torch.ones(4, 8, device=DEVICE)
+        info = {
+            'current_ratio': 0.4,  # ceil(4 * 0.4) = 2 sequences
+            'confidence': torch.zeros(4, 8, device=DEVICE),
+            'entropy': torch.ones(4, 8, device=DEVICE),
+            'selection': 'topk',
+            'scoring': 'combined',
+        }
+
+        model = CGGRModel(mock_causal_model, min_tokens_ratio=0.4, warmup_steps=0)
+        model.scorer = RecordingScorer(difficulty, mask, info)
+
+        loss = model(input_ids, labels=labels)
+        assert torch.isfinite(loss)
+        assert mock_causal_model.last_input_shape == (2, 8)
+        metrics = model.get_metrics()
+        assert metrics['router_tokens_selected'] == 32
+        assert metrics['sequences_selected'] == 2
+        assert metrics['sequence_selection_mode'] == 'quota_fallback'
+
+    def test_model_labels_shape_mismatch_raises(self, mock_causal_model):
+        model = CGGRModel(mock_causal_model, min_tokens_ratio=1.0, warmup_steps=0)
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (2, 6), device=DEVICE)
+        bad_labels = torch.randint(0, mock_causal_model.config.vocab_size, (2, 5), device=DEVICE)
+        with pytest.raises(ValueError, match="labels must match input_ids"):
+            _ = model(input_ids, labels=bad_labels)
+
+
+class TestTruncatedRouter:
+    def test_create_truncated_router_preserves_logits_shape(self, mock_causal_model):
+        router = create_truncated_router(mock_causal_model, num_layers=1).to(DEVICE)
+        input_ids = torch.randint(0, mock_causal_model.config.vocab_size, (2, 5), device=DEVICE)
+
+        logits = router(input_ids)
+
+        assert logits.shape == (2, 5, mock_causal_model.config.vocab_size)
+
+    def test_create_truncated_router_supports_masked_lm_layout(self, mock_masked_lm):
+        router = create_truncated_router(mock_masked_lm, num_layers=1).to(DEVICE)
+        input_ids = torch.randint(0, mock_masked_lm.config.vocab_size, (2, 5), device=DEVICE)
+
+        logits = router(input_ids)
+
+        assert logits.shape == (2, 5, mock_masked_lm.config.vocab_size)
+
+    def test_auto_architecture_falls_back_to_passthrough_when_truncation_fails(self):
+        model = MockFallbackRouterModel().to(DEVICE)
+        router = create_truncated_router(model, num_layers=1).to(DEVICE)
+        input_ids = torch.randint(0, model.config.vocab_size, (2, 5), device=DEVICE)
+
+        logits = router(input_ids)
+
+        assert router.passthrough is True
+        assert logits.shape == (2, 5, model.config.vocab_size)
+
+
+class TestValidationGuards:
+    def test_invalid_ratio_raises(self):
+        with pytest.raises(ValueError, match="min_tokens_ratio"):
+            _ = CGGRLoss(min_tokens_ratio=0.0)
+
+    def test_invalid_threshold_sensitivity_raises(self):
+        with pytest.raises(ValueError, match="threshold_sensitivity"):
+            _ = CGGRLoss(threshold_sensitivity=1.5)
+
+    def test_invalid_num_strata_raises(self):
+        with pytest.raises(ValueError, match="num_strata"):
+            _ = CGGRScorer(router=MockCausalLM().to(DEVICE), selection='stratified', num_strata=0)
+
+    def test_cggrloss_shape_mismatch_raises(self, sample_logits):
+        criterion = CGGRLoss()
+        bad_targets = torch.randint(0, 100, (2, 7), device=DEVICE)
+        with pytest.raises(ValueError, match="does not match targets shape"):
+            _ = criterion(sample_logits, bad_targets)
+
+    def test_cggrloss_bad_rank_raises(self):
+        criterion = CGGRLoss()
+        logits = torch.randn(2, 3, 4, 5, device=DEVICE)
+        targets = torch.randint(0, 5, (2, 3, 4), device=DEVICE)
+        with pytest.raises(ValueError, match="Unsupported logits shape"):
+            _ = criterion(logits, targets)
 
 
 # =============================================================================

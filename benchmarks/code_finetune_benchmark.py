@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Code Fine-tune Benchmark
-========================
-Compare Standard vs CGGR fine-tuning on high-quality code datasets.
+Experimental code fine-tune benchmark.
+
+This script is retained for research iteration on code datasets. It is not part
+of the canonical benchmark surface, and its outputs should be treated as
+experimental training results rather than hardened evidence.
 
 Usage:
     python code_finetune_benchmark.py --mode cggr --hours 12 --wandb
@@ -168,7 +170,7 @@ class Muon(torch.optim.Optimizer):
 # =============================================================================
 
 class CodeDataset(Dataset):
-    """Combined high-quality code dataset."""
+    """Combined exploratory code dataset."""
     
     def __init__(self, tokenizer, max_length: int = 2048, max_samples: int = 100000):
         from datasets import load_dataset
@@ -177,7 +179,7 @@ class CodeDataset(Dataset):
         self.max_length = max_length
         self.samples = []
         
-        console.print("[yellow]Loading high-quality code datasets...[/yellow]")
+        console.print("[yellow]Loading exploratory code datasets...[/yellow]")
         
         # 1. Code Alpaca - Instruction-following code
         try:
@@ -194,7 +196,7 @@ class CodeDataset(Dataset):
         except Exception as e:
             console.print(f"[yellow]Code Alpaca skipped: {e}[/yellow]")
         
-        # 2. Evol-Instruct-Code - High-quality evolved code instructions
+        # 2. Evol-Instruct-Code - exploratory evolved code instructions
         try:
             console.print("[cyan]Loading theblackcat102/evol-codealpaca-v1...[/cyan]")
             evol = load_dataset("theblackcat102/evol-codealpaca-v1", split="train")
@@ -623,7 +625,7 @@ def run_training(
         wandb.log({"final_loss": state.current_loss})
         wandb.finish()
     
-    console.print(f"\n[bold green]COMPLETE: {mode.upper()} - Final Loss: {state.current_loss:.4f}[/bold green]")
+        console.print(f"\n[bold green]RUN COMPLETE: {mode.upper()} - Final observed loss: {state.current_loss:.4f}[/bold green]")
     
     # Cleanup
     del model, base_model, optimizer

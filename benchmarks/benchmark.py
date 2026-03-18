@@ -1,8 +1,9 @@
 """
-CGGR Benchmark Suite
-====================
-Comprehensive benchmarking with SmolLM-135m.
-Measures timing, memory, and token routing behavior.
+Experimental CGGR benchmark suite.
+
+This script is retained for exploratory profiling and token-routing inspection.
+It is not part of the canonical benchmark surface and should not be cited as
+headline evidence without a matching hardened protocol.
 """
 
 import torch
@@ -392,7 +393,7 @@ def main():
         result = benchmark_cggr_loss(model, input_ids, labels, criterion)
         results.append(result)
     
-    # 3. CGGRModel with batch splitting (the real speedup)
+    # 3. CGGRModel with batch splitting (exploratory measurement)
     console.print("\n[bold magenta]Benchmarking CGGRModel (batch splitting, 25%)...[/bold magenta]")
     from cggr import CGGRModel
     
@@ -526,9 +527,8 @@ def main():
     best = min(results[1:], key=lambda r: r.backward_ms)
     speedup = baseline.backward_ms / best.backward_ms
     
-    console.print(f"[bold green]Best backward speedup: {speedup:.2f}x with {best.name}[/bold green]")
+    console.print(f"[bold green]Observed best backward speedup in this exploratory run: {speedup:.2f}x with {best.name}[/bold green]")
 
 
 if __name__ == "__main__":
     main()
-
